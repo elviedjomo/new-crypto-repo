@@ -1,0 +1,46 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "us-east-1"
+    S3_BUCKET: "crypto-app-artifacts"
+    BUILD_FOLDER: "crypto-app-build"   # Folder inside S3 where `imageDetail.json` is stored
+
+phases:
+  pre_build:
+    commands:
+      - echo "Fetching imageDetail.json from S3..."
+      - aws s3 cp s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json .
+
+      - echo "Extracting IMAGE_URI from imageDetail.json..."
+      - IMAGE_URI=$(jq -r '.imageURI' imageDetail.json)
+      - |
+        echo "Using IMAGE_URI: $IMAGE_URI"
+
+      - echo "Configuring kubeconfig for EKS..."
+      - aws eks update-kubeconfig --region us-east-1 --name staging-prod
+
+      - echo "Verifying EKS cluster access..."
+      - kubectl get nodes
+
+  build:
+    commands:
+      - echo "Updating Kubernetes manifest with image..."
+      - sed -i "s|__IMAGE__|$IMAGE_URI|g" kubernetes/deployment.yaml
+
+      - cat kubernetes/deployment.yaml
+
+      - echo "Applying Kubernetes deployment..."
+      - kubectl apply -f kubernetes/deployment.yaml
+      - kubectl apply -f kubernetes/service.yaml
+      - kubectl apply -f kubernetes/ingress.yaml
+
+  post_build:
+    commands:
+    - echo "Deployment complete. Retrieving ingress status..."
+    - echo "Waiting for ingress to be assigned an address..."
+    - sleep 10
+    - |
+      INGRESS_HOST=$(kubectl get ingress crypto-ingress -n development -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+      echo "Ingress is accessible at: http://$INGRESS_HOST"
+

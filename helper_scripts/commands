@@ -1,0 +1,8 @@
+docker rmi $(docker images -q)
+docker rm $(docker ps -a -q)
+
+docker build -t my-app .
+docker run -p 5000:5000 my-app
+
+docker pull 992382785132.dkr.ecr.us-east-1.amazonaws.com/crypto-app:c747243
+docker run -p 5000:5000 992382785132.dkr.ecr.us-east-1.amazonaws.com/crypto-app:c747243
