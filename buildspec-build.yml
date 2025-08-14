@@ -29,7 +29,7 @@ phases:
       - cat imageDetail.json
 
       - echo "Uploading imageDetail.json to S3..."
-      - aws s3 cp imageDetail.json s3://crypto-app-artifact-bucket /crypto-app-build/imageDetail.json
+      - aws s3 cp imageDetail.json s3://crypto-app-artifact-bucket/crypto-app-build/imageDetail.json
       
 artifacts:
   files:
