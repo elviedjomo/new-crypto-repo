@@ -3,7 +3,7 @@ version: 0.2
 env:
   variables:
     AWS_DEFAULT_REGION: "us-east-1"
-    S3_BUCKET: "crypto-app-artifacts"
+    S3_BUCKET: "crypto-app-artifact-bucket" # my s3 Bucket
     BUILD_FOLDER: "crypto-app-build"   # Folder inside S3 where `imageDetail.json` is stored
 
 phases:
