@@ -85,7 +85,13 @@ phases:
     commands:
       - 'echo "Pulling Docker image $IMAGE_URI"'
       - 'docker pull "$IMAGE_URI"'
-      - 'CONTAINER_NAME="ci-app-$CODEBUILD_BUILD_ID"'
+
+      # ----- SAFE CONTAINER NAME (no colons) -----
+      - 'COMMIT_SHORT=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" | cut -c1-7 || true)'
+      - 'CONTAINER_NAME="ci-app-${CODEBUILD_BUILD_NUMBER:-0}-${COMMIT_SHORT:-na}"'
+      - 'echo "Container name: $CONTAINER_NAME"'
+      # ------------------------------------------
+
       - 'echo "Starting $CONTAINER_NAME (-p ${EXTERNAL_PORT}:${CONTAINER_PORT}, PORT=${CONTAINER_PORT}, HOST=0.0.0.0)..."'
       - 'docker run -d --name "$CONTAINER_NAME" -e PORT="${CONTAINER_PORT}" -e HOST="0.0.0.0" -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" "$IMAGE_URI"'
       - 'CONTAINER_ID=$(docker inspect -f "{{.Id}}" "$CONTAINER_NAME") || { echo "Failed to start container"; exit 1; }'
