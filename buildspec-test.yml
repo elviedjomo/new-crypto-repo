@@ -62,7 +62,11 @@ env:
     AWS_DEFAULT_REGION: "us-east-1"
     S3_BUCKET: "crypto-app-artifact-bucket"
     BUILD_FOLDER: "crypto-app-build"
-    HEALTH_URL: "http://127.0.0.1:5000/"
+    # Health check config
+    EXTERNAL_PORT: "5000"          # host port
+    CONTAINER_PORT: "5000"         # container port your app listens on
+    HEALTH_PATH: "/"               # change to /health or /healthz if you have one
+    HEALTH_URL: "http://127.0.0.1:5000/"  # auto-updated below from EXTERNAL_PORT/HEALTH_PATH
 
 phases:
   pre_build:
@@ -77,17 +81,49 @@ phases:
       - 'REGISTRY_HOST=$(echo "$IMAGE_URI" | cut -d"/" -f1)'
       - 'aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"'
       - "echo ECR login successful."
+      # Normalize health URL from vars
+      - 'HEALTH_URL="http://127.0.0.1:${EXTERNAL_PORT}${HEALTH_PATH}"'
+      - 'echo "Health URL set to: $HEALTH_URL"'
 
   build:
     commands:
       - 'echo "Pulling Docker image $IMAGE_URI"'
       - 'docker pull "$IMAGE_URI"'
-      - 'echo "Starting container (port 5000 -> 5000)..."'
-      - 'CONTAINER_ID=$(docker run -d -p 5000:5000 "$IMAGE_URI")'
+      - 'echo "Starting container (-p ${EXTERNAL_PORT}:${CONTAINER_PORT}, PORT=${CONTAINER_PORT}, HOST=0.0.0.0)..."'
+      # 👇 Pass PORT and HOST envs (common across Flask/Node/FastAPI etc.), and map host→container ports explicitly
+      - 'CONTAINER_ID=$(docker run -d -e PORT="${CONTAINER_PORT}" -e HOST="0.0.0.0" -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" "$IMAGE_URI")'
       - 'echo "Container ID: $CONTAINER_ID"'
       - 'trap "docker rm -f $CONTAINER_ID >/dev/null 2>&1 || true" EXIT'
+
+      # Quick diagnostics
+      - 'docker ps -a || true'
+      - 'docker port "$CONTAINER_ID" || true'
+      - 'docker logs --tail=80 "$CONTAINER_ID" || true'
+
       - 'echo "Waiting for service to be ready at $HEALTH_URL ..."'
-      - 'for i in $(seq 1 30); do if curl -fsS "$HEALTH_URL" >/dev/null; then echo "Health check passed."; break; fi; sleep 2; if [ $i -eq 30 ]; then echo "ERROR: Health check failed after retries."; exit 1; fi; done'
+      # Try localhost first; if that fails, try container IP directly (helps reveal wrong port/bind issues)
+      - >
+        READY=0;
+        for i in $(seq 1 30); do
+          if curl -fsS "$HEALTH_URL" >/dev/null; then echo "Health check passed (localhost)."; READY=1; break; fi;
+          sleep 2;
+        done;
+        if [ "$READY" -ne 1 ]; then
+          echo "Localhost check failed; trying container IP...";
+          CIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER_ID");
+          ALT_URL="http://$CIP:${CONTAINER_PORT}${HEALTH_PATH}";
+          echo "Trying $ALT_URL";
+          for i in $(seq 1 10); do
+            if curl -fsS "$ALT_URL" >/dev/null; then echo "Health check passed (container IP)."; READY=1; break; fi;
+            sleep 2;
+          done;
+        fi;
+        if [ "$READY" -ne 1 ]; then
+          echo "ERROR: Health check failed. Dumping diagnostics...";
+          docker ps -a || true; docker port "$CONTAINER_ID" || true; docker logs --tail=200 "$CONTAINER_ID" || true;
+          docker exec "$CONTAINER_ID" sh -lc '(ss -lntp || netstat -lntp) 2>/dev/null' || true;
+          exit 1;
+        fi
 
   post_build:
     commands:
