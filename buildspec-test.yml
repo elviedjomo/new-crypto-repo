@@ -63,9 +63,9 @@ env:
     S3_BUCKET: "crypto-app-artifact-bucket"
     BUILD_FOLDER: "crypto-app-build"
     EXTERNAL_PORT: "5000"      # host port
-    CONTAINER_PORT: "5000"     # container port the app listens on
-    HEALTH_PATH: "/"           # e.g., /health or /healthz if you have one
-    FLASK_APP_NAME: "app:app"  # <<< set to your Flask app import path (wsgi:app, main:app, app.py, etc.)
+    CONTAINER_PORT: "5000"     # container's listen port
+    HEALTH_PATH: "/"           # e.g., /health or /healthz
+    FLASK_APP_NAME: "app:app"  # <<< change if your app is wsgi:app, main:app, app.py, etc.
 
 phases:
   pre_build:
@@ -87,62 +87,50 @@ phases:
       - 'echo "Pulling Docker image $IMAGE_URI"'
       - 'docker pull "$IMAGE_URI"'
 
-      # Safe container name (no colons)
+      # Safe, stable container name
       - 'COMMIT_SHORT=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" | cut -c1-7 || true)'
       - 'CONTAINER_NAME="ci-app-${CODEBUILD_BUILD_NUMBER:-0}-${COMMIT_SHORT:-na}"'
       - 'echo "Container name: $CONTAINER_NAME"'
 
-      # 1) Keep container alive with a long sleep as PID 1
-      - 'echo "Starting base container (sleep 3600) with port mapping ${EXTERNAL_PORT}:${CONTAINER_PORT} ..."'
-      - 'docker run -d --name "$CONTAINER_NAME" -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" "$IMAGE_URI" sleep 3600'
-      - 'CONTAINER_ID=$(docker inspect -f "{{.Id}}" "$CONTAINER_NAME") || { echo "Failed to start container"; exit 1; }'
-      - 'echo "Container ID: $CONTAINER_ID"'
-      - 'trap "docker rm -f $CONTAINER_ID >/dev/null 2>&1 || true" EXIT'
-
-      # 2) Start Flask inside the running container using python -m (more reliable than `flask` shim)
-      - 'echo "Launching Flask inside container: FLASK_APP=$FLASK_APP_NAME host=0.0.0.0 port=${CONTAINER_PORT}"'
+      # Start the app in a backgrounded docker run; capture logs to host file
+      - 'echo "Starting Flask: FLASK_APP=$FLASK_APP_NAME on 0.0.0.0:${CONTAINER_PORT} ..."'
       - >
-        docker exec "$CONTAINER_NAME" sh -lc '
-          export PYTHONUNBUFFERED=1;
-          export FLASK_APP="$FLASK_APP_NAME";
-          rm -f /tmp/app.log /tmp/app.pid 2>/dev/null || true;
-          (python -m flask run --host 0.0.0.0 --port "${CONTAINER_PORT}" > /tmp/app.log 2>&1 &) ;
-          echo $! > /tmp/app.pid ;
-          sleep 1;
-          ps -o pid,cmd -p "$(cat /tmp/app.pid 2>/dev/null || echo 0)" || true;
-        '
+        docker run --rm --name "$CONTAINER_NAME"
+        -e FLASK_APP="$FLASK_APP_NAME"
+        -p "${EXTERNAL_PORT}:${CONTAINER_PORT}"
+        "$IMAGE_URI"
+        python -m flask run --host 0.0.0.0 --port "${CONTAINER_PORT}"
+        > server.log 2>&1 &
+      - 'RUN_PID=$!'
+      - 'echo "docker run PID: $RUN_PID"'
+      - 'sleep 1'
+      - 'echo "--- initial server.log (head) ---"; head -n 60 server.log || true'
 
-      # Quick diagnostics
-      - 'docker ps -a --filter "id=$CONTAINER_ID" --no-trunc || true'
-      - 'docker port "$CONTAINER_ID" || true'
-      - 'docker exec "$CONTAINER_NAME" sh -lc "head -n 40 /tmp/app.log || true"'
-
-      # 3) Health check loop (localhost on host)
+      # Health check loop against host localhost
       - 'echo "Waiting for service to be ready at $HEALTH_URL ..."'
       - >
         READY=0;
         for i in $(seq 1 30); do
-          if curl -fsS "$HEALTH_URL" >/dev/null; then echo "Health check passed (localhost)."; READY=1; break; fi;
+          if curl -fsS "$HEALTH_URL" >/dev/null; then echo "Health check passed."; READY=1; break; fi;
           sleep 2;
         done;
         if [ "$READY" -ne 1 ]; then
-          echo "Localhost check failed. Dumping diagnostics...";
-          echo "--- /tmp/app.log (tail) ---";
-          docker exec "$CONTAINER_NAME" sh -lc "tail -n 200 /tmp/app.log || true";
-          echo "--- Flask PID & ps ---";
-          docker exec "$CONTAINER_NAME" sh -lc "echo PID=$(cat /tmp/app.pid 2>/dev/null || echo missing); ps aux | grep -E \"flask|gunicorn|uvicorn|python -m flask\" | grep -v grep || true";
-          echo "--- Listening ports ---";
-          docker exec "$CONTAINER_NAME" sh -lc "(ss -lntp || netstat -lntp) 2>/dev/null || true";
+          echo "Health check failed.";
+          echo "--- server.log (tail) ---"; tail -n 200 server.log || true;
+          echo "--- docker ps (for visibility) ---"; docker ps -a || true;
           exit 1;
         fi
 
   post_build:
     commands:
-      - 'echo "Stopping and removing container..."'
-      - 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true'
+      - 'echo "Stopping container..."'
+      - 'docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true'
+      - 'echo "--- final server.log (tail) ---"'
+      - 'tail -n 80 server.log || true'
       - 'echo "Test job completed successfully."'
 
 artifacts:
   files:
     - imageDetail.json
+    - server.log
   discard-paths: yes
