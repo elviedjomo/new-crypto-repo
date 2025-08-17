@@ -86,37 +86,45 @@ phases:
       - 'echo "Pulling Docker image $IMAGE_URI"'
       - 'docker pull "$IMAGE_URI"'
 
-      # ----- SAFE CONTAINER NAME (no colons) -----
+      # Safe container name (no colons)
       - 'COMMIT_SHORT=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" | cut -c1-7 || true)'
       - 'CONTAINER_NAME="ci-app-${CODEBUILD_BUILD_NUMBER:-0}-${COMMIT_SHORT:-na}"'
       - 'echo "Container name: $CONTAINER_NAME"'
-      # ------------------------------------------
 
       - 'echo "Starting $CONTAINER_NAME (-p ${EXTERNAL_PORT}:${CONTAINER_PORT}, PORT=${CONTAINER_PORT}, HOST=0.0.0.0)..."'
       - 'docker run -d --name "$CONTAINER_NAME" -e PORT="${CONTAINER_PORT}" -e HOST="0.0.0.0" -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" "$IMAGE_URI"'
       - 'CONTAINER_ID=$(docker inspect -f "{{.Id}}" "$CONTAINER_NAME") || { echo "Failed to start container"; exit 1; }'
       - 'echo "Container ID: $CONTAINER_ID"'
-      - 'trap "docker rm -f $CONTAINER_NAME >/dev/null 2>&1 || true" EXIT'
+      - 'trap "docker rm -f $CONTAINER_ID >/dev/null 2>&1 || true" EXIT'
 
-      # Immediate state check
-      - 'STATUS=$(docker inspect -f "{{.State.Status}}" "$CONTAINER_NAME" || true)'
-      - 'EXITCODE=$(docker inspect -f "{{.State.ExitCode}}" "$CONTAINER_NAME" || true)'
-      - 'echo "Initial container state: $STATUS (exit=$EXITCODE)"'
+      # Give Docker a tick, then check by ID (not by name)
+      - 'sleep 1'
+      - 'STATUS=$(docker inspect -f "{{.State.Status}}" "$CONTAINER_ID" || true)'
+      - 'EXITCODE=$(docker inspect -f "{{.State.ExitCode}}" "$CONTAINER_ID" || true)'
+      - 'echo "Initial container state: ${STATUS:-unknown} (exit=${EXITCODE:-?})"'
+
+      # If it vanished or exited, dump deep diagnostics and fail fast
       - |
-        if [ "$STATUS" != "running" ]; then
-          echo "Container is not running. Recent logs:" ;
-          docker logs --tail=200 "$CONTAINER_NAME" || true ;
-          echo "State detail:" ;
-          docker inspect -f '{{json .State}}' "$CONTAINER_NAME" || true ;
+        if [ -z "$STATUS" ] || [ "$STATUS" = "exited" ] || [ "$STATUS" = "dead" ]; then
+          echo "Container is not running. Image details for debugging:" ;
+          docker image inspect "$IMAGE_URI" -f 'Entrypoint: {{json .Config.Entrypoint}}' || true ;
+          docker image inspect "$IMAGE_URI" -f 'Cmd        : {{json .Config.Cmd}}'        || true ;
+          docker image inspect "$IMAGE_URI" -f 'Exposed    : {{json .Config.ExposedPorts}}' || true ;
+          echo "Recent docker events for this container (last 10s):" ;
+          docker events --since 10s --until now --filter "container=$CONTAINER_ID" || true ;
+          echo "Recent logs (if any):" ;
+          docker logs --tail=200 "$CONTAINER_ID" || true ;
+          echo "Full State:" ;
+          docker inspect -f '{{json .State}}' "$CONTAINER_ID" || true ;
           exit 1 ;
         fi
 
-      # Quick diagnostics while running
-      - 'docker ps -a --filter "name=$CONTAINER_NAME" --no-trunc || true'
-      - 'docker port "$CONTAINER_NAME" || true'
-      - 'docker logs --tail=80 "$CONTAINER_NAME" || true'
+      # Still running → quick diagnostics
+      - 'docker ps -a --filter "id=$CONTAINER_ID" --no-trunc || true'
+      - 'docker port "$CONTAINER_ID" || true'
+      - 'docker logs --tail=80 "$CONTAINER_ID" || true'
 
-      # Health check
+      # Health check on localhost
       - 'echo "Waiting for service to be ready at $HEALTH_URL ..."'
       - >
         READY=0;
@@ -126,15 +134,15 @@ phases:
         done;
         if [ "$READY" -ne 1 ]; then
           echo "Localhost check failed. Dumping diagnostics...";
-          docker logs --tail=200 "$CONTAINER_NAME" || true;
-          docker inspect -f '{{json .State}}' "$CONTAINER_NAME" || true;
+          docker logs --tail=200 "$CONTAINER_ID" || true;
+          docker inspect -f '{{json .State}}' "$CONTAINER_ID" || true;
           exit 1;
         fi
 
   post_build:
     commands:
       - 'echo "Stopping and removing container..."'
-      - 'docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true'
+      - 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true'
       - 'echo "Test job completed successfully."'
 
 artifacts:
