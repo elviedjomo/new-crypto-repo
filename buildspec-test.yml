@@ -64,8 +64,8 @@ env:
     BUILD_FOLDER: "crypto-app-build"
     EXTERNAL_PORT: "5000"      # host port
     CONTAINER_PORT: "5000"     # container's listen port
-    HEALTH_PATH: "/"           # e.g., /health or /healthz
-    FLASK_APP_NAME: "app:app"  # <<< change if your app is wsgi:app, main:app, app.py, etc.
+    HEALTH_PATH: "/"           # change to /health or /healthz if your app exposes one
+    FLASK_APP_NAME: "app:app"  # <<< set to your Flask app import path (e.g., wsgi:app, main:app, app.py)
 
 phases:
   pre_build:
@@ -80,7 +80,7 @@ phases:
       - 'REGISTRY_HOST=$(echo "$IMAGE_URI" | cut -d"/" -f1)'
       - 'aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"'
       - 'HEALTH_URL="http://127.0.0.1:${EXTERNAL_PORT}${HEALTH_PATH}"'
-      - 'echo "Health URL set to: $HEALTH_URL"'
+      - 'echo "Health URL (host loopback): $HEALTH_URL"'
 
   build:
     commands:
@@ -92,33 +92,59 @@ phases:
       - 'CONTAINER_NAME="ci-app-${CODEBUILD_BUILD_NUMBER:-0}-${COMMIT_SHORT:-na}"'
       - 'echo "Container name: $CONTAINER_NAME"'
 
-      # Start the app in a backgrounded docker run; capture logs to host file
+      # Start Flask in foreground (no -d) and capture output to host log
       - 'echo "Starting Flask: FLASK_APP=$FLASK_APP_NAME on 0.0.0.0:${CONTAINER_PORT} ..."'
       - >
-        docker run --rm --name "$CONTAINER_NAME"
+        docker run --name "$CONTAINER_NAME"
         -e FLASK_APP="$FLASK_APP_NAME"
         -p "${EXTERNAL_PORT}:${CONTAINER_PORT}"
         "$IMAGE_URI"
         python -m flask run --host 0.0.0.0 --port "${CONTAINER_PORT}"
         > server.log 2>&1 &
-      - 'RUN_PID=$!'
-      - 'echo "docker run PID: $RUN_PID"'
       - 'sleep 1'
       - 'echo "--- initial server.log (head) ---"; head -n 60 server.log || true'
 
-      # Health check loop against host localhost
-      - 'echo "Waiting for service to be ready at $HEALTH_URL ..."'
-      - >
-        READY=0;
-        for i in $(seq 1 30); do
-          if curl -fsS "$HEALTH_URL" >/dev/null; then echo "Health check passed."; READY=1; break; fi;
-          sleep 2;
-        done;
+      # Health check: try host loopback first, then container bridge IP
+      - 'echo "Waiting for service to be ready..."'
+      - |
+        READY=0
+
+        # Try host loopback (published port)
+        for i in $(seq 1 20); do
+          if curl -fsS "$HEALTH_URL" >/dev/null; then
+            echo "Health check passed via host loopback: $HEALTH_URL"
+            READY=1
+            break
+          fi
+          sleep 2
+        done
+
+        # Fallback to container bridge IP if needed
         if [ "$READY" -ne 1 ]; then
-          echo "Health check failed.";
-          echo "--- server.log (tail) ---"; tail -n 200 server.log || true;
-          echo "--- docker ps (for visibility) ---"; docker ps -a || true;
-          exit 1;
+          CIP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+          if [ -n "$CIP" ]; then
+            ALT_URL="http://$CIP:${CONTAINER_PORT}${HEALTH_PATH}"
+            echo "Host loopback failed; trying container IP: $ALT_URL"
+            for i in $(seq 1 20); do
+              if curl -fsS "$ALT_URL" >/dev/null; then
+                echo "Health check passed via container IP: $ALT_URL"
+                READY=1
+                break
+              fi
+              sleep 2
+            done
+          else
+            echo "Could not determine container IP."
+          fi
+        fi
+
+        # Final diagnostics on failure
+        if [ "$READY" -ne 1 ]; then
+          echo "Health checks failed. Diagnostics..."
+          echo "--- server.log (tail) ---"; tail -n 200 server.log || true
+          echo "--- docker ps ---"; docker ps -a || true
+          echo "--- container ports ---"; docker inspect -f '{{json .NetworkSettings.Ports}}' "$CONTAINER_NAME" || true
+          exit 1
         fi
 
   post_build:
