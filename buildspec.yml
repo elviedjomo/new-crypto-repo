@@ -1,36 +1,70 @@
+# version: 0.2
+
+# phases:
+#   pre_build:
+#     commands:
+#       - echo "Logging in to Amazon ECR..."
+#       - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 503561459342.dkr.ecr.us-east-1.amazonaws.com
+#       - REPOSITORY_URI=503561459342.dkr.ecr.us-east-1.amazonaws.com/crypto-project
+#       - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+#       - IMAGE_TAG=${COMMIT_HASH:=latest}
+#   build:
+#     commands:
+#       - echo "Building the Docker image..."
+#       - docker build -t $REPOSITORY_URI:latest .
+#       - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+#   post_build:
+#     commands:
+#       - echo "Pushing the Docker image..."
+#       - docker push $REPOSITORY_URI:latest
+#       - docker push $REPOSITORY_URI:$IMAGE_TAG
+
+#       - echo "Setting IMAGE_URI variable..."
+#       - export IMAGE_URI="$REPOSITORY_URI:$IMAGE_TAG"
+
+#        # ✅ Use jq for safer JSON creation
+#       - echo "Creating JSON output file..."
+#       - echo '{}' | jq --arg img "$IMAGE_URI" '.imageURI = $img' > imageDetail.json
+#       - echo "Verifying JSON output before uploading..."
+#       - cat imageDetail.json
+
+#       - echo "Uploading imageDetail.json to S3..."
+#       - aws s3 cp imageDetail.json s3://crypto-app-artifact-bucket/crypto-app-build/imageDetail.json
+      
+# artifacts:
+#   files:
+#     - imageDetail.json
+#   discard-paths: yes
 version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "us-east-1"
+    REPOSITORY_URI: "503561459342.dkr.ecr.us-east-1.amazonaws.com/crypto-project"
 
 phases:
   pre_build:
     commands:
       - echo "Logging in to Amazon ECR..."
-      - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 503561459342.dkr.ecr.us-east-1.amazonaws.com
-      - REPOSITORY_URI=503561459342.dkr.ecr.us-east-1.amazonaws.com/crypto-project
-      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
-      - IMAGE_TAG=${COMMIT_HASH:=latest}
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REPOSITORY_URI"
+      - COMMIT_SHORT=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" | cut -c1-7 || true)
+      - IMAGE_TAG=${COMMIT_SHORT:-latest}
+      - echo "IMAGE_TAG=$IMAGE_TAG"
+
   build:
     commands:
       - echo "Building the Docker image..."
-      - docker build -t $REPOSITORY_URI:latest .
-      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+      - docker build -t "$REPOSITORY_URI:$IMAGE_TAG" -t "$REPOSITORY_URI:latest" .
+
   post_build:
     commands:
       - echo "Pushing the Docker image..."
-      - docker push $REPOSITORY_URI:latest
-      - docker push $REPOSITORY_URI:$IMAGE_TAG
-
-      - echo "Setting IMAGE_URI variable..."
-      - export IMAGE_URI="$REPOSITORY_URI:$IMAGE_TAG"
-
-       # ✅ Use jq for safer JSON creation
-      - echo "Creating JSON output file..."
-      - echo '{}' | jq --arg img "$IMAGE_URI" '.imageURI = $img' > imageDetail.json
-      - echo "Verifying JSON output before uploading..."
+      - docker push "$REPOSITORY_URI:$IMAGE_TAG"
+      - docker push "$REPOSITORY_URI:latest"
+      - printf '{"imageUri":"%s:%s"}' "$REPOSITORY_URI" "$IMAGE_TAG" > imageDetail.json
+      - echo "imageDetail.json:"
       - cat imageDetail.json
 
-      - echo "Uploading imageDetail.json to S3..."
-      - aws s3 cp imageDetail.json s3://crypto-app-artifact-bucket/crypto-app-build/imageDetail.json
-      
 artifacts:
   files:
     - imageDetail.json

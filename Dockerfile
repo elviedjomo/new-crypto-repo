@@ -20,41 +20,64 @@
 # # Run flask application
 # CMD ["flask", "run"]
 # --- Base image (slim = smaller & faster) ---
-    FROM public.ecr.aws/docker/library/python:3.11-slim-bullseye
+    # FROM public.ecr.aws/docker/library/python:3.11-slim-bullseye
 
-    # --- OS & Python hygiene ---
-    ENV PYTHONDONTWRITEBYTECODE=1 \
-        PYTHONUNBUFFERED=1
+    # # --- OS & Python hygiene ---
+    # ENV PYTHONDONTWRITEBYTECODE=1 \
+    #     PYTHONUNBUFFERED=1
     
-    WORKDIR /app
+    # WORKDIR /app
     
-    # --- Install deps with cache-friendly layers ---
-    # If you need build tools (e.g., for some wheels), uncomment apt packages:
-    # RUN apt-get update && apt-get install -y --no-install-recommends build-essential curl && rm -rf /var/lib/apt/lists/*
-    COPY requirements.txt .
-    RUN pip install --upgrade pip && \
-        pip install --no-cache-dir -r requirements.txt && \
-        pip install --no-cache-dir gunicorn
+    # # --- Install deps with cache-friendly layers ---
+    # # If you need build tools (e.g., for some wheels), uncomment apt packages:
+    # # RUN apt-get update && apt-get install -y --no-install-recommends build-essential curl && rm -rf /var/lib/apt/lists/*
+    # COPY requirements.txt .
+    # RUN pip install --upgrade pip && \
+    #     pip install --no-cache-dir -r requirements.txt && \
+    #     pip install --no-cache-dir gunicorn
     
-    # --- Copy app code last (so deps cache stays hot) ---
-    COPY . .
+    # # --- Copy app code last (so deps cache stays hot) ---
+    # COPY . .
     
-    # --- Networking & health ---
-    EXPOSE 5000
-    ENV PORT=5000
-    # Prefer probing a cheap health endpoint you add in Flask (see note below)
-    HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
-      CMD python - <<'PY' || exit 1
-    import os, sys, urllib.request
-    url=f"http://127.0.0.1:{os.environ.get('PORT','5000')}/healthz"
-    try:
-        with urllib.request.urlopen(url, timeout=2) as r:
-            sys.exit(0 if r.status==200 else 1)
-    except Exception:
-        sys.exit(1)
-    PY
+    # # --- Networking & health ---
+    # EXPOSE 5000
+    # ENV PORT=5000
+    # # Prefer probing a cheap health endpoint you add in Flask (see note below)
+    # HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
+    #   CMD python - <<'PY' || exit 1
+    # import os, sys, urllib.request
+    # url=f"http://127.0.0.1:{os.environ.get('PORT','5000')}/healthz"
+    # try:
+    #     with urllib.request.urlopen(url, timeout=2) as r:
+    #         sys.exit(0 if r.status==200 else 1)
+    # except Exception:
+    #     sys.exit(1)
+    # PY
     
-    # --- Start the app with Gunicorn ---
-    # IMPORTANT: "app:app" assumes your module is "app.py" and it defines `app = Flask(__name__)`
-    CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:5000", "app:app"]
-    
+    # # --- Start the app with Gunicorn ---
+    # # IMPORTANT: "app:app" assumes your module is "app.py" and it defines `app = Flask(__name__)`
+    # CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:5000", "app:app"]
+    # Use an official Python runtime as a parent image
+FROM public.ecr.aws/docker/library/python:3.11-bullseye
+
+WORKDIR /usr/src/app
+COPY . .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# (Optional but handy) install curl for HEALTHCHECK
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+EXPOSE 5000
+ENV FLASK_APP=app.py \
+    FLASK_RUN_HOST=0.0.0.0 \
+    FLASK_RUN_PORT=5000 \
+    PORT=5000
+
+# Keep this pointed at "/" since your root returns 200 in logs.
+# Change to /healthz if you add that route.
+HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:${PORT:-5000}/" || exit 1
+
+# Run flask application
+CMD ["flask", "run"]
