@@ -64,8 +64,8 @@ env:
     BUILD_FOLDER: "crypto-app-build"
     EXTERNAL_PORT: "5000"      # host port
     CONTAINER_PORT: "5000"     # container port the app listens on
-    HEALTH_PATH: "/"           # change to /health or /healthz if you have one
-    FLASK_APP_NAME: "app:app"  # <<< set to your Flask app import path
+    HEALTH_PATH: "/"           # e.g., /health or /healthz if you have one
+    FLASK_APP_NAME: "app:app"  # <<< set to your Flask app import path (wsgi:app, main:app, app.py, etc.)
 
 phases:
   pre_build:
@@ -86,45 +86,38 @@ phases:
     commands:
       - 'echo "Pulling Docker image $IMAGE_URI"'
       - 'docker pull "$IMAGE_URI"'
+
+      # Safe container name (no colons)
       - 'COMMIT_SHORT=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" | cut -c1-7 || true)'
       - 'CONTAINER_NAME="ci-app-${CODEBUILD_BUILD_NUMBER:-0}-${COMMIT_SHORT:-na}"'
       - 'echo "Container name: $CONTAINER_NAME"'
 
-      # Run Flask explicitly as entrypoint: flask --app <module> run --host 0.0.0.0 --port <port>
-      - >
-        docker run -d --name "$CONTAINER_NAME"
-        -p "${EXTERNAL_PORT}:${CONTAINER_PORT}"
-        --entrypoint flask
-        "$IMAGE_URI"
-        --app "$FLASK_APP_NAME" run --host 0.0.0.0 --port "${CONTAINER_PORT}"
-
+      # 1) Keep container alive with a long sleep as PID 1
+      - 'echo "Starting base container (sleep 3600) with port mapping ${EXTERNAL_PORT}:${CONTAINER_PORT} ..."'
+      - 'docker run -d --name "$CONTAINER_NAME" -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" "$IMAGE_URI" sleep 3600'
       - 'CONTAINER_ID=$(docker inspect -f "{{.Id}}" "$CONTAINER_NAME") || { echo "Failed to start container"; exit 1; }'
       - 'echo "Container ID: $CONTAINER_ID"'
       - 'trap "docker rm -f $CONTAINER_ID >/dev/null 2>&1 || true" EXIT'
 
-      - 'sleep 1'
-      - 'STATUS=$(docker inspect -f "{{.State.Status}}" "$CONTAINER_ID" || true)'
-      - 'EXITCODE=$(docker inspect -f "{{.State.ExitCode}}" "$CONTAINER_ID" || true)'
-      - 'echo "Initial container state: ${STATUS:-unknown} (exit=${EXITCODE:-?})"'
+      # 2) Start Flask inside the running container using python -m (more reliable than `flask` shim)
+      - 'echo "Launching Flask inside container: FLASK_APP=$FLASK_APP_NAME host=0.0.0.0 port=${CONTAINER_PORT}"'
+      - >
+        docker exec "$CONTAINER_NAME" sh -lc '
+          export PYTHONUNBUFFERED=1;
+          export FLASK_APP="$FLASK_APP_NAME";
+          rm -f /tmp/app.log /tmp/app.pid 2>/dev/null || true;
+          (python -m flask run --host 0.0.0.0 --port "${CONTAINER_PORT}" > /tmp/app.log 2>&1 &) ;
+          echo $! > /tmp/app.pid ;
+          sleep 1;
+          ps -o pid,cmd -p "$(cat /tmp/app.pid 2>/dev/null || echo 0)" || true;
+        '
 
-      - |
-        if [ -z "$STATUS" ] || [ "$STATUS" = "exited" ] || [ "$STATUS" = "dead" ]; then
-          echo "Container is not running. Image details for debugging:" ;
-          docker image inspect "$IMAGE_URI" -f 'Entrypoint: {{json .Config.Entrypoint}}' || true ;
-          docker image inspect "$IMAGE_URI" -f 'Cmd        : {{json .Config.Cmd}}'        || true ;
-          docker image inspect "$IMAGE_URI" -f 'Exposed    : {{json .Config.ExposedPorts}}' || true ;
-          echo "Recent logs (if any):" ;
-          docker logs --tail=200 "$CONTAINER_NAME" || true ;
-          echo "Full State:" ;
-          docker inspect -f '{{json .State}}' "$CONTAINER_NAME" || true ;
-          echo "TIP: Ensure FLASK_APP_NAME matches your module (e.g., wsgi:app)." ;
-          exit 1 ;
-        fi
-
+      # Quick diagnostics
       - 'docker ps -a --filter "id=$CONTAINER_ID" --no-trunc || true'
       - 'docker port "$CONTAINER_ID" || true'
-      - 'docker logs --tail=80 "$CONTAINER_ID" || true'
+      - 'docker exec "$CONTAINER_NAME" sh -lc "head -n 40 /tmp/app.log || true"'
 
+      # 3) Health check loop (localhost on host)
       - 'echo "Waiting for service to be ready at $HEALTH_URL ..."'
       - >
         READY=0;
@@ -134,8 +127,12 @@ phases:
         done;
         if [ "$READY" -ne 1 ]; then
           echo "Localhost check failed. Dumping diagnostics...";
-          docker logs --tail=200 "$CONTAINER_ID" || true;
-          docker inspect -f '{{json .State}}' "$CONTAINER_ID" || true;
+          echo "--- /tmp/app.log (tail) ---";
+          docker exec "$CONTAINER_NAME" sh -lc "tail -n 200 /tmp/app.log || true";
+          echo "--- Flask PID & ps ---";
+          docker exec "$CONTAINER_NAME" sh -lc "echo PID=$(cat /tmp/app.pid 2>/dev/null || echo missing); ps aux | grep -E \"flask|gunicorn|uvicorn|python -m flask\" | grep -v grep || true";
+          echo "--- Listening ports ---";
+          docker exec "$CONTAINER_NAME" sh -lc "(ss -lntp || netstat -lntp) 2>/dev/null || true";
           exit 1;
         fi
 
