@@ -62,26 +62,22 @@ env:
     AWS_DEFAULT_REGION: "us-east-1"
     S3_BUCKET: "crypto-app-artifact-bucket"
     BUILD_FOLDER: "crypto-app-build"
-    # Health check config
-    EXTERNAL_PORT: "5000"          # host port
-    CONTAINER_PORT: "5000"         # container port your app listens on
-    HEALTH_PATH: "/"               # change to /health or /healthz if you have one
-    HEALTH_URL: "http://127.0.0.1:5000/"  # auto-updated below from EXTERNAL_PORT/HEALTH_PATH
+    EXTERNAL_PORT: "5000"      # host port
+    CONTAINER_PORT: "5000"     # container port your app listens on
+    HEALTH_PATH: "/"           # change to /health or /healthz if you have one
 
 phases:
   pre_build:
     commands:
-      - "set -euo pipefail"
-      - "echo Fetching imageDetail.json from s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json ..."
-      - "aws s3 cp s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json ."
-      - "command -v jq >/dev/null || (echo Installing jq... && (yum install -y jq || (apt-get update && apt-get install -y jq)))"
+      - 'set -euo pipefail'
+      - 'echo "Fetching imageDetail.json from s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json ..."'
+      - 'aws s3 cp "s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json" .'
+      - 'command -v jq >/dev/null || (echo "Installing jq..." && (yum install -y jq || (apt-get update && apt-get install -y jq)))'
       - 'IMAGE_URI=$(jq -r ".imageUri // .imageURI // empty" imageDetail.json)'
       - 'test -n "$IMAGE_URI" && [ "$IMAGE_URI" != "null" ] || { echo "ERROR: imageUri not found"; cat imageDetail.json; exit 1; }'
       - 'echo "Using Image URI: $IMAGE_URI"'
       - 'REGISTRY_HOST=$(echo "$IMAGE_URI" | cut -d"/" -f1)'
       - 'aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"'
-      - "echo ECR login successful."
-      # Normalize health URL from vars
       - 'HEALTH_URL="http://127.0.0.1:${EXTERNAL_PORT}${HEALTH_PATH}"'
       - 'echo "Health URL set to: $HEALTH_URL"'
 
@@ -89,19 +85,33 @@ phases:
     commands:
       - 'echo "Pulling Docker image $IMAGE_URI"'
       - 'docker pull "$IMAGE_URI"'
-      - 'echo "Starting container (-p ${EXTERNAL_PORT}:${CONTAINER_PORT}, PORT=${CONTAINER_PORT}, HOST=0.0.0.0)..."'
-      # 👇 Pass PORT and HOST envs (common across Flask/Node/FastAPI etc.), and map host→container ports explicitly
-      - 'CONTAINER_ID=$(docker run -d -e PORT="${CONTAINER_PORT}" -e HOST="0.0.0.0" -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" "$IMAGE_URI")'
+      - 'CONTAINER_NAME="ci-app-$CODEBUILD_BUILD_ID"'
+      - 'echo "Starting $CONTAINER_NAME (-p ${EXTERNAL_PORT}:${CONTAINER_PORT}, PORT=${CONTAINER_PORT}, HOST=0.0.0.0)..."'
+      - 'docker run -d --name "$CONTAINER_NAME" -e PORT="${CONTAINER_PORT}" -e HOST="0.0.0.0" -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" "$IMAGE_URI"'
+      - 'CONTAINER_ID=$(docker inspect -f "{{.Id}}" "$CONTAINER_NAME") || { echo "Failed to start container"; exit 1; }'
       - 'echo "Container ID: $CONTAINER_ID"'
-      - 'trap "docker rm -f $CONTAINER_ID >/dev/null 2>&1 || true" EXIT'
+      - 'trap "docker rm -f $CONTAINER_NAME >/dev/null 2>&1 || true" EXIT'
 
-      # Quick diagnostics
-      - 'docker ps -a || true'
-      - 'docker port "$CONTAINER_ID" || true'
-      - 'docker logs --tail=80 "$CONTAINER_ID" || true'
+      # Immediate state check
+      - 'STATUS=$(docker inspect -f "{{.State.Status}}" "$CONTAINER_NAME" || true)'
+      - 'EXITCODE=$(docker inspect -f "{{.State.ExitCode}}" "$CONTAINER_NAME" || true)'
+      - 'echo "Initial container state: $STATUS (exit=$EXITCODE)"'
+      - |
+        if [ "$STATUS" != "running" ]; then
+          echo "Container is not running. Recent logs:" ;
+          docker logs --tail=200 "$CONTAINER_NAME" || true ;
+          echo "State detail:" ;
+          docker inspect -f '{{json .State}}' "$CONTAINER_NAME" || true ;
+          exit 1 ;
+        fi
 
+      # Quick diagnostics while running
+      - 'docker ps -a --filter "name=$CONTAINER_NAME" --no-trunc || true'
+      - 'docker port "$CONTAINER_NAME" || true'
+      - 'docker logs --tail=80 "$CONTAINER_NAME" || true'
+
+      # Health check
       - 'echo "Waiting for service to be ready at $HEALTH_URL ..."'
-      # Try localhost first; if that fails, try container IP directly (helps reveal wrong port/bind issues)
       - >
         READY=0;
         for i in $(seq 1 30); do
@@ -109,24 +119,19 @@ phases:
           sleep 2;
         done;
         if [ "$READY" -ne 1 ]; then
-          echo "Localhost check failed; trying container IP...";
-          CIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER_ID");
-          ALT_URL="http://$CIP:${CONTAINER_PORT}${HEALTH_PATH}";
-          echo "Trying $ALT_URL";
-          for i in $(seq 1 10); do
-            if curl -fsS "$ALT_URL" >/dev/null; then echo "Health check passed (container IP)."; READY=1; break; fi;
-            sleep 2;
-          done;
-        fi;
-        if [ "$READY" -ne 1 ]; then
-          echo "ERROR: Health check failed. Dumping diagnostics...";
-          docker ps -a || true; docker port "$CONTAINER_ID" || true; docker logs --tail=200 "$CONTAINER_ID" || true;
-          docker exec "$CONTAINER_ID" sh -lc '(ss -lntp || netstat -lntp) 2>/dev/null' || true;
+          echo "Localhost check failed. Dumping diagnostics...";
+          docker logs --tail=200 "$CONTAINER_NAME" || true;
+          docker inspect -f '{{json .State}}' "$CONTAINER_NAME" || true;
           exit 1;
         fi
 
   post_build:
     commands:
       - 'echo "Stopping and removing container..."'
-      - 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true'
+      - 'docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true'
       - 'echo "Test job completed successfully."'
+
+artifacts:
+  files:
+    - imageDetail.json
+  discard-paths: yes
