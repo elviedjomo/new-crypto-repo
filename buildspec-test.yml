@@ -62,12 +62,10 @@ env:
     AWS_DEFAULT_REGION: "us-east-1"
     S3_BUCKET: "crypto-app-artifact-bucket"
     BUILD_FOLDER: "crypto-app-build"
-    EXTERNAL_PORT: "5000"          # host port
-    CONTAINER_PORT: "5000"         # container port your app listens on
-    HEALTH_PATH: "/"               # change to /health or /healthz if you have one
-    # >>> Set this to YOUR Flask app import path <<<
-    # Common values: app:app  |  wsgi:app  |  main:app  |  app.py
-    FLASK_APP_NAME: "app:app"
+    EXTERNAL_PORT: "5000"      # host port
+    CONTAINER_PORT: "5000"     # container port the app listens on
+    HEALTH_PATH: "/"           # change to /health or /healthz if you have one
+    FLASK_APP_NAME: "app:app"  # <<< set to your Flask app import path
 
 phases:
   pre_build:
@@ -88,31 +86,27 @@ phases:
     commands:
       - 'echo "Pulling Docker image $IMAGE_URI"'
       - 'docker pull "$IMAGE_URI"'
-
-      # Safe container name (no colons)
       - 'COMMIT_SHORT=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" | cut -c1-7 || true)'
       - 'CONTAINER_NAME="ci-app-${CODEBUILD_BUILD_NUMBER:-0}-${COMMIT_SHORT:-na}"'
       - 'echo "Container name: $CONTAINER_NAME"'
 
-      - 'echo "Starting $CONTAINER_NAME with Flask env (FLASK_APP=$FLASK_APP_NAME, host 0.0.0.0, port ${CONTAINER_PORT}) ..."'
+      # Run Flask explicitly as entrypoint: flask --app <module> run --host 0.0.0.0 --port <port>
       - >
-        docker run -d --name "$CONTAINER_NAME" \
-          -e FLASK_APP="$FLASK_APP_NAME" \
-          -e FLASK_RUN_HOST="0.0.0.0" \
-          -e FLASK_RUN_PORT="${CONTAINER_PORT}" \
-          -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" \
-          "$IMAGE_URI"
+        docker run -d --name "$CONTAINER_NAME"
+        -p "${EXTERNAL_PORT}:${CONTAINER_PORT}"
+        --entrypoint flask
+        "$IMAGE_URI"
+        --app "$FLASK_APP_NAME" run --host 0.0.0.0 --port "${CONTAINER_PORT}"
+
       - 'CONTAINER_ID=$(docker inspect -f "{{.Id}}" "$CONTAINER_NAME") || { echo "Failed to start container"; exit 1; }'
       - 'echo "Container ID: $CONTAINER_ID"'
       - 'trap "docker rm -f $CONTAINER_ID >/dev/null 2>&1 || true" EXIT'
 
-      # Give Docker a tick, then check by ID (not by name)
       - 'sleep 1'
       - 'STATUS=$(docker inspect -f "{{.State.Status}}" "$CONTAINER_ID" || true)'
       - 'EXITCODE=$(docker inspect -f "{{.State.ExitCode}}" "$CONTAINER_ID" || true)'
       - 'echo "Initial container state: ${STATUS:-unknown} (exit=${EXITCODE:-?})"'
 
-      # If it exited, dump diagnostics & fail fast
       - |
         if [ -z "$STATUS" ] || [ "$STATUS" = "exited" ] || [ "$STATUS" = "dead" ]; then
           echo "Container is not running. Image details for debugging:" ;
@@ -120,19 +114,17 @@ phases:
           docker image inspect "$IMAGE_URI" -f 'Cmd        : {{json .Config.Cmd}}'        || true ;
           docker image inspect "$IMAGE_URI" -f 'Exposed    : {{json .Config.ExposedPorts}}' || true ;
           echo "Recent logs (if any):" ;
-          docker logs --tail=200 "$CONTAINER_ID" || true ;
+          docker logs --tail=200 "$CONTAINER_NAME" || true ;
           echo "Full State:" ;
-          docker inspect -f '{{json .State}}' "$CONTAINER_ID" || true ;
-          echo "TIP: If this is a Flask app, ensure FLASK_APP points to a real module (e.g., app:app or wsgi:app)." ;
+          docker inspect -f '{{json .State}}' "$CONTAINER_NAME" || true ;
+          echo "TIP: Ensure FLASK_APP_NAME matches your module (e.g., wsgi:app)." ;
           exit 1 ;
         fi
 
-      # While running → quick diagnostics
       - 'docker ps -a --filter "id=$CONTAINER_ID" --no-trunc || true'
       - 'docker port "$CONTAINER_ID" || true'
       - 'docker logs --tail=80 "$CONTAINER_ID" || true'
 
-      # Health check on localhost
       - 'echo "Waiting for service to be ready at $HEALTH_URL ..."'
       - >
         READY=0;
