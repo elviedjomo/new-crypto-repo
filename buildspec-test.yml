@@ -67,49 +67,30 @@ env:
 phases:
   pre_build:
     commands:
-      - set -euo pipefail
-      - echo "Fetching imageDetail.json from s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json ..."
-      - aws s3 cp "s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json" .
-      # Ensure jq exists
-      - command -v jq >/dev/null || (echo "Installing jq..." && (yum install -y jq || (apt-get update && apt-get install -y jq)))
-      - echo "Extracting IMAGE_URI..."
-      # Support both imageUri (preferred) and imageURI
-      - IMAGE_URI="$(jq -r '.imageUri // .imageURI // empty' imageDetail.json)"
-      - |
-        if [ -z "${IMAGE_URI}" ] || [ "${IMAGE_URI}" = "null" ]; then
-          echo "ERROR: imageUri not found in imageDetail.json"; cat imageDetail.json; exit 1
-        fi
-      - echo "Using Image URI: ${IMAGE_URI}"
-      - echo "Logging into Amazon ECR..."
-      - REGISTRY_HOST="$(echo "${IMAGE_URI}" | cut -d'/' -f1)"
-      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
-        | docker login --username AWS --password-stdin "$REGISTRY_HOST"
-      - echo "ECR login successful."
+      - "set -euo pipefail"
+      - "echo Fetching imageDetail.json from s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json ..."
+      - "aws s3 cp s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json ."
+      - "command -v jq >/dev/null || (echo Installing jq... && (yum install -y jq || (apt-get update && apt-get install -y jq)))"
+      - 'IMAGE_URI=$(jq -r ".imageUri // .imageURI // empty" imageDetail.json)'
+      - 'test -n "$IMAGE_URI" && [ "$IMAGE_URI" != "null" ] || { echo "ERROR: imageUri not found"; cat imageDetail.json; exit 1; }'
+      - 'echo "Using Image URI: $IMAGE_URI"'
+      - 'REGISTRY_HOST=$(echo "$IMAGE_URI" | cut -d"/" -f1)'
+      - 'aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"'
+      - "echo ECR login successful."
 
   build:
     commands:
-      - echo "Pulling Docker image ${IMAGE_URI}..."
-      - docker pull "${IMAGE_URI}"
-      - echo "Starting container (port 5000 -> 5000)..."
-      - CONTAINER_ID="$(docker run -d -p 5000:5000 "${IMAGE_URI}")"
-      - echo "Container ID: ${CONTAINER_ID}"
-      # Always clean up the container even if something fails
-      - trap 'docker rm -f "${CONTAINER_ID}" >/dev/null 2>&1 || true' EXIT
-      - echo "Waiting for service to be ready at ${HEALTH_URL} ..."
-      # Retry health check up to ~60s
-      - |
-        for i in $(seq 1 30); do
-          if curl -fsS "${HEALTH_URL}" >/dev/null; then
-            echo "Health check passed."; break
-          fi
-          sleep 2
-          if [ $i -eq 30 ]; then
-            echo "ERROR: Health check failed after retries."; exit 1
-          fi
-        done
+      - 'echo "Pulling Docker image $IMAGE_URI"'
+      - 'docker pull "$IMAGE_URI"'
+      - 'echo "Starting container (port 5000 -> 5000)..."'
+      - 'CONTAINER_ID=$(docker run -d -p 5000:5000 "$IMAGE_URI")'
+      - 'echo "Container ID: $CONTAINER_ID"'
+      - 'trap "docker rm -f $CONTAINER_ID >/dev/null 2>&1 || true" EXIT'
+      - 'echo "Waiting for service to be ready at $HEALTH_URL ..."'
+      - 'for i in $(seq 1 30); do if curl -fsS "$HEALTH_URL" >/dev/null; then echo "Health check passed."; break; fi; sleep 2; if [ $i -eq 30 ]; then echo "ERROR: Health check failed after retries."; exit 1; fi; done'
 
   post_build:
     commands:
-      - echo "Stopping and removing container..."
-      - docker rm -f "${CONTAINER_ID}" >/dev/null 2>&1 || true
-      - echo "Test job completed successfully."
+      - 'echo "Stopping and removing container..."'
+      - 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true'
+      - 'echo "Test job completed successfully."'
