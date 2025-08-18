@@ -42,8 +42,8 @@ env:
     AWS_DEFAULT_REGION: us-east-1
     ECR_ACCOUNT_ID: "503561459342"
     ECR_REPOSITORY: "crypto-project"
-    CONTAINER_NAME: "app"                # harmless if unused; enables imagedefinitions.json
-    USE_S3: "false"                      # set to "true" only if you really need S3 upload
+    CONTAINER_NAME: "app"          # optional: used to emit imagedefinitions.json
+    USE_S3: "false"                # prefer CodePipeline artifacts; set "true" only if you must upload to S3
     S3_BUCKET: "crypto-app-artifact-bucket"
     BUILD_FOLDER: "crypto-app-build"
   exported-variables:
@@ -52,12 +52,13 @@ env:
 
 phases:
   install:
-    runtime-versions:
-      docker: 20
     commands:
       - set -Eeuo pipefail
+      - echo "==> Checking Docker availability"
+      - docker --version
       - echo "==> Login to Amazon ECR"
-      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${ECR_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+        | docker login --username AWS --password-stdin "${ECR_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
       - IMAGE_URI="${ECR_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY}"
       - echo "IMAGE_URI=$IMAGE_URI"
 
@@ -78,11 +79,10 @@ phases:
       - docker push "$IMAGE_URI:$IMAGE_TAG"
       - docker push "$IMAGE_URI:latest"
       - echo "==> Emitting artifacts"
-      # Lowercase key to match your current consumers; adjust if you prefer "ImageURI"
+      # Keep key as "imageURI" to match your test/deploy steps; switch to "ImageURI" if you prefer.
       - printf '{"imageURI":"%s"}' "$IMAGE_URI:$IMAGE_TAG" > imageDetail.json
-      # Optional artifact if you ever use the ECS Deploy action
       - printf '[{"name":"%s","imageUri":"%s"}]' "$CONTAINER_NAME" "$IMAGE_URI:$IMAGE_TAG" > imagedefinitions.json
-      # Optional S3 upload (prefer CodePipeline artifacts instead)
+      # Optional S3 upload (use CodePipeline artifacts instead when possible)
       - if [ "${USE_S3}" = "true" ]; then aws s3 cp imageDetail.json "s3://${S3_BUCKET}/${BUILD_FOLDER}/imageDetail.json"; fi
 
 artifacts:
