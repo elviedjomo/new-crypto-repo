@@ -52,7 +52,7 @@ phases:
       docker: 20
     commands:
       - set -Eeuo pipefail
-      - echo "==> Logging in to Amazon ECR"
+      - echo "==> Login to ECR"
       - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${ECR_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
       - IMAGE_URI="${ECR_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY}"
       - echo "IMAGE_URI=$IMAGE_URI"
@@ -70,7 +70,7 @@ phases:
 
   post_build:
     commands:
-      - echo "==> Pushing images"
+      - echo "==> Pushing"
       - docker push "$IMAGE_URI:$IMAGE_TAG"
       - docker push "$IMAGE_URI:latest"
       - echo "==> Emitting artifacts"
