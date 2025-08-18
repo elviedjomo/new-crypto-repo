@@ -1,46 +1,188 @@
+# version: 0.2
+
+# env:
+#   variables:
+#     AWS_DEFAULT_REGION: "us-east-1"
+#     S3_BUCKET: "crypto-app-artifact-bucket" # my s3 Bucket
+#     BUILD_FOLDER: "crypto-app-build"   # Folder inside S3 where `imageDetail.json` is stored
+
+# phases:
+#   pre_build:
+#     commands:
+#       - echo "Fetching imageDetail.json from S3..."
+#       - aws s3 cp s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json .
+
+#       - echo "Extracting IMAGE_URI from imageDetail.json..."
+#       - IMAGE_URI=$(jq -r '.imageURI' imageDetail.json)
+#       - |
+#         echo "Using IMAGE_URI: $IMAGE_URI"
+
+#       - echo "Configuring kubeconfig for EKS..."
+#       - aws eks update-kubeconfig --region us-east-1 --name staging-prod
+
+#       - echo "Verifying EKS cluster access..."
+#       - kubectl get nodes
+
+#   build:
+#     commands:
+#       - echo "Updating Kubernetes manifest with image..."
+#       - sed -i "s|__IMAGE__|$IMAGE_URI|g" kubernetes/deployment.yaml
+
+#       - cat kubernetes/deployment.yaml
+
+#       - echo "Applying Kubernetes deployment..."
+#       - kubectl apply -f kubernetes/deployment.yaml
+#       - kubectl apply -f kubernetes/service.yaml
+#       - kubectl apply -f kubernetes/ingress.yaml
+
+#   post_build:
+#     commands:
+#     - echo "Deployment complete. Retrieving ingress status..."
+#     - echo "Waiting for ingress to be assigned an address..."
+#     - sleep 10
+#     - |
+#       INGRESS_HOST=$(kubectl get ingress crypto-ingress -n development -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+#       echo "Ingress is accessible at: http://$INGRESS_HOST"
 version: 0.2
 
 env:
   variables:
     AWS_DEFAULT_REGION: "us-east-1"
-    S3_BUCKET: "crypto-app-artifact-bucket" # my s3 Bucket
-    BUILD_FOLDER: "crypto-app-build"   # Folder inside S3 where `imageDetail.json` is stored
+
+    # ---- Inputs / toggles ----
+    USE_S3: "false"                    # prefer CodePipeline artifact; set "true" only if you can't wire artifacts
+    S3_BUCKET: "crypto-app-artifact-bucket"
+    BUILD_FOLDER: "crypto-app-build"
+
+    # ---- EKS/K8s config ----
+    CLUSTER_NAME: "staging-prod"       # your EKS cluster name
+    NAMESPACE: "development"           # k8s namespace for your app
+    DEPLOYMENT_NAME: "crypto-deployment"   # name of your Deployment
+    CONTAINER_NAME: "crypto-container"     # container name inside the Deployment (kubectl set image target)
+
+    # ---- Manifests (adjust if your paths differ) ----
+    DEPLOYMENT_FILE: "kubernetes/deployment.yaml"
+    SERVICE_FILE: "kubernetes/service.yaml"
+    INGRESS_FILE: "kubernetes/ingress.yaml"
+
+    # ---- Timeouts ----
+    ROLLOUT_TIMEOUT: "300s"            # kubectl rollout timeout
+    INGRESS_TIMEOUT_SECS: "300"        # max wait for ingress hostname/IP
 
 phases:
   pre_build:
     commands:
-      - echo "Fetching imageDetail.json from S3..."
-      - aws s3 cp s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json .
+      - set -Eeuo pipefail
+      - echo "==> Region: $AWS_DEFAULT_REGION"
 
-      - echo "Extracting IMAGE_URI from imageDetail.json..."
-      - IMAGE_URI=$(jq -r '.imageURI' imageDetail.json)
+      # 1) Get imageDetail.json (prefer artifact from previous stage)
       - |
-        echo "Using IMAGE_URI: $IMAGE_URI"
+        if [ "${USE_S3}" = "true" ]; then
+          echo "==> Fetching imageDetail.json from s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json"
+          aws s3 cp "s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json" .
+        else
+          echo "==> Using imageDetail.json from CodePipeline input artifact (recommended)"
+        fi
+      - test -f imageDetail.json || { echo "ERROR: imageDetail.json not found"; ls -la; exit 1; }
 
-      - echo "Configuring kubeconfig for EKS..."
-      - aws eks update-kubeconfig --region us-east-1 --name staging-prod
+      # 2) Tools (jq + kubectl) — install if missing
+      - |
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "==> Installing jq..."
+          (command -v dnf && sudo dnf install -y jq) || \
+          (command -v yum && sudo yum install -y jq) || \
+          (command -v apt-get && sudo apt-get update && sudo apt-get install -y jq) || \
+          { echo "ERROR: jq install failed"; exit 1; }
+        fi
+      - |
+        if ! command -v kubectl >/dev/null 2>&1; then
+          echo "==> Installing kubectl..."
+          curl -sSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          kubectl version --client=true
+        fi
 
-      - echo "Verifying EKS cluster access..."
-      - kubectl get nodes
+      # 3) Parse Image URI (accept various casings)
+      - |
+        IMAGE_URI=$(jq -r '.ImageURI // .imageURI // .imageUri // empty' imageDetail.json)
+        test -n "$IMAGE_URI" && [ "$IMAGE_URI" != "null" ] || { echo "ERROR: ImageURI not found in imageDetail.json"; cat imageDetail.json; exit 1; }
+        echo "==> Using IMAGE_URI: $IMAGE_URI"
+
+      # 4) Configure kubeconfig and verify access
+      - echo "==> Writing kubeconfig for cluster: $CLUSTER_NAME"
+      - aws eks update-kubeconfig --region "$AWS_DEFAULT_REGION" --name "$CLUSTER_NAME"
+      - echo "==> Verifying cluster access"
+      - kubectl get nodes -o wide | sed -e 's/^[[:space:]]*//'
+
+      # 5) Ensure namespace exists
+      - |
+        if ! kubectl get ns "$NAMESPACE" >/dev/null 2>&1; then
+          echo "==> Creating namespace: $NAMESPACE"
+          kubectl create namespace "$NAMESPACE"
+        fi
 
   build:
     commands:
-      - echo "Updating Kubernetes manifest with image..."
-      - sed -i "s|__IMAGE__|$IMAGE_URI|g" kubernetes/deployment.yaml
+      - echo "==> Applying Service & Ingress (idempotent)"
+      - kubectl apply -n "$NAMESPACE" -f "$SERVICE_FILE" || { echo "Service apply failed"; exit 1; }
+      - kubectl apply -n "$NAMESPACE" -f "$INGRESS_FILE" || { echo "Ingress apply failed"; exit 1; }
 
-      - cat kubernetes/deployment.yaml
+      # Update image in the Deployment without mutating files.
+      # If your manifest uses a placeholder __IMAGE__, we fallback to sed+apply.
+      - |
+        echo "==> Applying Deployment with image: $IMAGE_URI"
+        if grep -q "__IMAGE__" "$DEPLOYMENT_FILE"; then
+          echo "   Detected __IMAGE__ placeholder, using sed to replace and apply"
+          tmpfile=$(mktemp)
+          sed "s|__IMAGE__|$IMAGE_URI|g" "$DEPLOYMENT_FILE" > "$tmpfile"
+          kubectl apply -n "$NAMESPACE" -f "$tmpfile"
+          rm -f "$tmpfile"
+        else
+          echo "   No placeholder found; applying manifest then setting image"
+          kubectl apply -n "$NAMESPACE" -f "$DEPLOYMENT_FILE"
+          kubectl set image -n "$NAMESPACE" "deployment/$DEPLOYMENT_NAME" "$CONTAINER_NAME=$IMAGE_URI" --record=true
+        fi
 
-      - echo "Applying Kubernetes deployment..."
-      - kubectl apply -f kubernetes/deployment.yaml
-      - kubectl apply -f kubernetes/service.yaml
-      - kubectl apply -f kubernetes/ingress.yaml
+      - echo "==> Waiting for rollout to complete (deployment/$DEPLOYMENT_NAME)"
+      - kubectl rollout status -n "$NAMESPACE" "deployment/$DEPLOYMENT_NAME" --timeout="$ROLLOUT_TIMEOUT"
 
   post_build:
     commands:
-    - echo "Deployment complete. Retrieving ingress status..."
-    - echo "Waiting for ingress to be assigned an address..."
-    - sleep 10
-    - |
-      INGRESS_HOST=$(kubectl get ingress crypto-ingress -n development -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-      echo "Ingress is accessible at: http://$INGRESS_HOST"
+      - echo "==> Fetching Ingress address (ingress in $NAMESPACE)"
+      - |
+        deadline=$(( $(date +%s) + ${INGRESS_TIMEOUT_SECS} ))
+        INGRESS_HOST=""
+        INGRESS_NAME=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].metadata.name}' || echo "")
+        if [ -z "$INGRESS_NAME" ]; then
+          echo "WARN: No Ingress objects found in namespace $NAMESPACE"
+        else
+          echo "Ingress resource detected: $INGRESS_NAME"
+          while [ $(date +%s) -lt $deadline ]; do
+            INGRESS_HOST=$(kubectl get ingress "$INGRESS_NAME" -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            [ -z "$INGRESS_HOST" ] && INGRESS_HOST=$(kubectl get ingress "$INGRESS_NAME" -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            if [ -n "$INGRESS_HOST" ]; then
+              echo "==> Ingress address: $INGRESS_HOST"
+              break
+            fi
+            sleep 5
+          done
+        fi
+
+      - echo "==> Writing deploy-result.json"
+      - |
+        jq -n --arg image "$IMAGE_URI" \
+              --arg cluster "$CLUSTER_NAME" \
+              --arg ns "$NAMESPACE" \
+              --arg dep "$DEPLOYMENT_NAME" \
+              --arg ingress "${INGRESS_HOST:-}" \
+              '{imageURI:$image, cluster:$cluster, namespace:$ns, deployment:$dep, ingress:$ingress}' > deploy-result.json
+      - cat deploy-result.json || true
+      - echo "==> Deployment complete."
+
+artifacts:
+  files:
+    - imageDetail.json
+    - deploy-result.json
+  discard-paths: yes
+
 

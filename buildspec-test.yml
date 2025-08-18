@@ -55,208 +55,134 @@
 #       - docker stop $CONTAINER_ID
 #       - docker rm $CONTAINER_ID
 #       - echo "Test job completed successfully."
-# version: 0.2
-
-# env:
-#   variables:
-#     AWS_DEFAULT_REGION: "us-east-1"
-#     S3_BUCKET: "crypto-app-artifact-bucket"
-#     BUILD_FOLDER: "crypto-app-build"
-#     EXTERNAL_PORT: "5000"      # host port
-#     CONTAINER_PORT: "5000"     # container's listen port
-#     HEALTH_PATH: "/"           # change to /health or /healthz if your app exposes one
-#     FLASK_APP_NAME: "app:app"  # <<< set to your Flask app import path (e.g., wsgi:app, main:app, app.py)
-
-# phases:
-#   pre_build:
-#     commands:
-#       - 'set -euo pipefail'
-#       - 'echo "Fetching imageDetail.json from s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json ..."'
-#       - 'aws s3 cp "s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json" .'
-#       - 'command -v jq >/dev/null || (echo "Installing jq..." && (yum install -y jq || (apt-get update && apt-get install -y jq)))'
-#       - 'IMAGE_URI=$(jq -r ".imageUri // .imageURI // empty" imageDetail.json)'
-#       - 'test -n "$IMAGE_URI" && [ "$IMAGE_URI" != "null" ] || { echo "ERROR: imageUri not found"; cat imageDetail.json; exit 1; }'
-#       - 'echo "Using Image URI: $IMAGE_URI"'
-#       - 'REGISTRY_HOST=$(echo "$IMAGE_URI" | cut -d"/" -f1)'
-#       - 'aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"'
-#       - 'HEALTH_URL="http://127.0.0.1:${EXTERNAL_PORT}${HEALTH_PATH}"'
-#       - 'echo "Health URL (host loopback): $HEALTH_URL"'
-
-#   build:
-#     commands:
-#       - 'echo "Pulling Docker image $IMAGE_URI"'
-#       - 'docker pull "$IMAGE_URI"'
-
-#       # Safe, stable container name
-#       - 'COMMIT_SHORT=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" | cut -c1-7 || true)'
-#       - 'CONTAINER_NAME="ci-app-${CODEBUILD_BUILD_NUMBER:-0}-${COMMIT_SHORT:-na}"'
-#       - 'echo "Container name: $CONTAINER_NAME"'
-
-#       # Start Flask in foreground (no -d) and capture output to host log
-#       - 'echo "Starting Flask: FLASK_APP=$FLASK_APP_NAME on 0.0.0.0:${CONTAINER_PORT} ..."'
-#       - >
-#         docker run --name "$CONTAINER_NAME"
-#         -e FLASK_APP="$FLASK_APP_NAME"
-#         -p "${EXTERNAL_PORT}:${CONTAINER_PORT}"
-#         "$IMAGE_URI"
-#         python -m flask run --host 0.0.0.0 --port "${CONTAINER_PORT}"
-#         > server.log 2>&1 &
-#       - 'sleep 1'
-#       - 'echo "--- initial server.log (head) ---"; head -n 60 server.log || true'
-
-#       # Health check: try host loopback first, then container bridge IP
-#       - 'echo "Waiting for service to be ready..."'
-#       - |
-#         READY=0
-
-#         # Try host loopback (published port)
-#         for i in $(seq 1 20); do
-#           if curl -fsS "$HEALTH_URL" >/dev/null; then
-#             echo "Health check passed via host loopback: $HEALTH_URL"
-#             READY=1
-#             break
-#           fi
-#           sleep 2
-#         done
-
-#         # Fallback to container bridge IP if needed
-#         if [ "$READY" -ne 1 ]; then
-#           CIP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || true)"
-#           if [ -n "$CIP" ]; then
-#             ALT_URL="http://$CIP:${CONTAINER_PORT}${HEALTH_PATH}"
-#             echo "Host loopback failed; trying container IP: $ALT_URL"
-#             for i in $(seq 1 20); do
-#               if curl -fsS "$ALT_URL" >/dev/null; then
-#                 echo "Health check passed via container IP: $ALT_URL"
-#                 READY=1
-#                 break
-#               fi
-#               sleep 2
-#             done
-#           else
-#             echo "Could not determine container IP."
-#           fi
-#         fi
-
-#         # Final diagnostics on failure
-#         if [ "$READY" -ne 1 ]; then
-#           echo "Health checks failed. Diagnostics..."
-#           echo "--- server.log (tail) ---"; tail -n 200 server.log || true
-#           echo "--- docker ps ---"; docker ps -a || true
-#           echo "--- container ports ---"; docker inspect -f '{{json .NetworkSettings.Ports}}' "$CONTAINER_NAME" || true
-#           exit 1
-#         fi
-
-#   post_build:
-#     commands:
-#       - 'echo "Stopping container..."'
-#       - 'docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true'
-#       - 'echo "--- final server.log (tail) ---"'
-#       - 'tail -n 80 server.log || true'
-#       - 'echo "Test job completed successfully."'
-
-# artifacts:
-#   files:
-#     - imageDetail.json
-#     - server.log
-#   discard-paths: yes
 version: 0.2
 
 env:
   variables:
     AWS_DEFAULT_REGION: "us-east-1"
+    # If your Pipeline's Test action is wired to take the Build output artifact,
+    # imageDetail.json will already be in the working directory.
+    # If you *must* fetch from S3, set these and flip USE_S3=true.
     S3_BUCKET: "crypto-app-artifact-bucket"
     BUILD_FOLDER: "crypto-app-build"
-    EXTERNAL_PORT: "5000"       # host port
-    CONTAINER_PORT: "5000"      # container port
-    HEALTH_PATH: "/"            # use "/" unless you add a /healthz route
+    USE_S3: "false"                 # prefer CodePipeline artifacts -> set to "true" only if needed
+    EXTERNAL_PORT: "5000"           # host port
+    CONTAINER_PORT: "5000"          # container port
+    HEALTH_PATH: "/healthz"         # change if your app exposes a different probe path
+    WAIT_TIMEOUT_SECONDS: "60"      # max wait for health to pass
+    SLEEP_SECONDS: "2"              # polling interval
 
 phases:
   pre_build:
     commands:
-      - 'set -euo pipefail'
-      - 'echo "Fetching imageDetail.json from s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json ..."'
-      - 'aws s3 cp "s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json" .'
-      - 'command -v jq >/dev/null || (echo "Installing jq..." && (yum install -y jq || (apt-get update && apt-get install -y jq)))'
-      - 'IMAGE_URI=$(jq -r ".imageUri // .imageURI // empty" imageDetail.json)'
-      - 'test -n "$IMAGE_URI" && [ "$IMAGE_URI" != "null" ] || { echo "ERROR: imageUri not found"; cat imageDetail.json; exit 1; }'
-      - 'echo "Using Image URI: $IMAGE_URI"'
-      - 'REGISTRY_HOST=$(echo "$IMAGE_URI" | cut -d"/" -f1)'
-      - 'aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"'
-      - 'echo "ECR login succeeded."'
+      - set -Eeuo pipefail
+      - echo "==> Environment check"
+      - docker --version
+      - echo "Region: $AWS_DEFAULT_REGION"
+
+      # 1) Obtain imageDetail.json (prefer artifact passed from Build stage)
+      - |
+        if [ "${USE_S3}" = "true" ]; then
+          echo "==> Fetching imageDetail.json from s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json"
+          aws s3 cp "s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json" .
+        else
+          echo "==> Using imageDetail.json from CodePipeline input artifact (recommended)"
+        fi
+      - test -f imageDetail.json || { echo "ERROR: imageDetail.json not found"; ls -la; exit 1; }
+
+      # 2) jq (robust install for whichever base the CodeBuild image uses)
+      - |
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "==> Installing jq..."
+          (command -v dnf && sudo dnf install -y jq) || \
+          (command -v yum && sudo yum install -y jq) || \
+          (command -v apt-get && sudo apt-get update && sudo apt-get install -y jq) || \
+          { echo "ERROR: could not install jq"; exit 1; }
+        fi
+
+      # 3) Parse Image URI (accept various casings)
+      - |
+        IMAGE_URI=$(jq -r '.ImageURI // .imageURI // .imageUri // empty' imageDetail.json)
+        test -n "$IMAGE_URI" && [ "$IMAGE_URI" != "null" ] || { echo "ERROR: ImageURI not found in imageDetail.json"; cat imageDetail.json; exit 1; }
+        echo "==> Using Image URI: $IMAGE_URI"
+
+      # 4) ECR login (derive registry host from IMAGE_URI)
+      - REGISTRY_HOST="$(echo "$IMAGE_URI" | cut -d'/' -f1)"
+      - echo "==> Logging in to ECR: $REGISTRY_HOST"
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"
+
+      # Precompute health URL
+      - HEALTH_URL="http://127.0.0.1:${EXTERNAL_PORT}${HEALTH_PATH}"
+      - echo "==> Health URL: $HEALTH_URL"
 
   build:
     commands:
-      - 'echo "Pulling Docker image $IMAGE_URI"'
-      - 'docker pull "$IMAGE_URI"'
+      - echo "==> Pulling $IMAGE_URI"
+      - docker pull "$IMAGE_URI"
 
-      - 'COMMIT_SHORT=$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" | cut -c1-7 || true)'
-      - 'CONTAINER_NAME="ci-app-${CODEBUILD_BUILD_NUMBER:-0}-${COMMIT_SHORT:-na}"'
-      - 'echo "Container name: $CONTAINER_NAME"'
+      # Stable, unique container name
+      - COMMIT_SHORT="$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" | cut -c1-7 || true)"
+      - CONTAINER_NAME="ci-app-${CODEBUILD_BUILD_NUMBER:-0}-${COMMIT_SHORT:-na}"
+      - echo "==> Container name: $CONTAINER_NAME"
 
-      # Start container with image CMD ("flask run" from your Dockerfile)
-      - 'echo "Starting container (-p ${EXTERNAL_PORT}:${CONTAINER_PORT}) ..."'
-      - 'docker run -d --name "$CONTAINER_NAME" -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" "$IMAGE_URI"'
-      - 'sleep 1'
+      # Start container with its default CMD; pass PORT in case your image expects it
+      - echo "==> Starting container and publishing $EXTERNAL_PORT:$CONTAINER_PORT"
+      - docker run --name "$CONTAINER_NAME" -e PORT="$CONTAINER_PORT" -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" -d "$IMAGE_URI"
 
-      # Stream logs to file (artifact), but DO NOT trap/cleanup here
-      - 'docker logs -f "$CONTAINER_NAME" > server.log 2>&1 & LOG_PID=$!'
-      - 'echo "--- initial server.log (head) ---"; head -n 60 server.log || true'
+      # Collect logs continuously in background for debugging if needed
+      - echo "==> Tailing container logs to server.log"
+      - (docker logs -f "$CONTAINER_NAME" > server.log 2>&1) &
+      - LOG_PID=$!
 
-      # Health check: try container IP first, then host loopback
+      # Health wait loop: try host loopback first, then container IP as fallback
       - |
-        echo "Waiting for service to be ready (container IP, then host loopback) ..."
+        echo "==> Waiting for service to become healthy..."
+        deadline=$(( $(date +%s) + ${WAIT_TIMEOUT_SECONDS} ))
         READY=0
+        while [ $(date +%s) -lt $deadline ]; do
+          if curl -fsS "$HEALTH_URL" >/dev/null; then
+            echo "==> Health check passed via host loopback: $HEALTH_URL"
+            READY=1
+            break
+          fi
+          sleep "${SLEEP_SECONDS}"
+        done
 
-        CIP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || true)"
-        if [ -n "$CIP" ]; then
-          ALT_URL="http://$CIP:${CONTAINER_PORT}${HEALTH_PATH}"
-          echo "Trying container IP: $ALT_URL"
-          for i in $(seq 1 20); do
-            if curl -fsS "$ALT_URL" >/dev/null; then
-              echo "Health check passed via container IP: $ALT_URL"
-              READY=1
-              break
-            fi
-            sleep 2
-          done
-        else
-          echo "Could not determine container IP."
+        if [ "$READY" -ne 1 ]; then
+          CIP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+          if [ -n "$CIP" ]; then
+            ALT_URL="http://$CIP:${CONTAINER_PORT}${HEALTH_PATH}"
+            echo "==> Trying container bridge IP: $ALT_URL"
+            while [ $(date +%s) -lt $deadline ]; do
+              if curl -fsS "$ALT_URL" >/dev/null; then
+                echo "==> Health check passed via container IP: $ALT_URL"
+                READY=1
+                break
+              fi
+              sleep "${SLEEP_SECONDS}"
+            done
+          fi
         fi
 
         if [ "$READY" -ne 1 ]; then
-          HEALTH_URL="http://127.0.0.1:${EXTERNAL_PORT}${HEALTH_PATH}"
-          echo "Trying host loopback: $HEALTH_URL"
-          for i in $(seq 1 10); do
-            if curl -fsS "$HEALTH_URL" >/dev/null; then
-              echo "Health check passed via host loopback: $HEALTH_URL"
-              READY=1
-              break
-            fi
-            sleep 2
-          done
-        fi
-
-        if [ "$READY" -ne 1 ]; then
-          echo "Health checks failed. Diagnostics..."
+          echo "ERROR: Health checks failed."
           echo "--- server.log (tail) ---"; tail -n 200 server.log || true
           echo "--- docker ps ---"; docker ps -a || true
-          echo "--- container ports ---"; docker inspect -f '{{json .NetworkSettings.Ports}}' "$CONTAINER_NAME" || true
+          echo "--- ports ---"; docker inspect -f '{{json .NetworkSettings.Ports}}' "$CONTAINER_NAME" || true
           exit 1
         fi
 
   post_build:
     commands:
-      - 'echo "Stopping container..."'
-      - 'docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true'
-      - 'if [ -n "${LOG_PID:-}" ]; then kill "$LOG_PID" >/dev/null 2>&1 || true; fi'
-      - 'sleep 1'
-      - 'echo "--- final server.log (tail) ---"'
-      - 'tail -n 120 server.log || true'
-      - 'echo "Test job completed successfully."'
+      - echo "==> Stopping container"
+      - docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+      - echo "==> Final server.log (tail)"
+      - tail -n 120 server.log || true
+      - echo "==> Tests completed successfully."
 
 artifacts:
   files:
     - imageDetail.json
     - server.log
   discard-paths: yes
+
