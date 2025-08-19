@@ -60,16 +60,14 @@ version: 0.2
 env:
   variables:
     AWS_DEFAULT_REGION: "us-east-1"
-
-    # Prefer getting imageDetail.json from the Build stage artifact.
-    # Set USE_S3="true" ONLY if you cannot pass artifacts through CodePipeline.
+    # Prefer pipeline artifacts; leave false unless you really need S3 fallback.
     USE_S3: "false"
     S3_BUCKET: "crypto-app-artifact-bucket"
     BUILD_FOLDER: "crypto-app-build"
 
-    EXTERNAL_PORT: "5000"          # host port exposed by docker run
-    CONTAINER_PORT: "5000"         # container's listen port
-    HEALTH_PATH: "/healthz"        # change if your app uses a different path
+    EXTERNAL_PORT: "5000"
+    CONTAINER_PORT: "5000"
+    HEALTH_PATH: "/healthz"
     WAIT_TIMEOUT_SECONDS: "60"
     SLEEP_SECONDS: "2"
 
@@ -77,12 +75,17 @@ phases:
   pre_build:
     commands:
       - 'set -Eeuo pipefail'
-      - 'echo "==> Locate imageDetail.json"'
-      - 'if [ "${USE_S3}" = "true" ]; then aws s3 cp "s3://${S3_BUCKET}/${BUILD_FOLDER}/imageDetail.json" .; else echo "Using CodePipeline artifact (recommended)"; fi'
-      - 'test -f imageDetail.json || { echo "ERROR: imageDetail.json not found in workspace"; ls -la; exit 1; }'
+      - 'echo "==> Locate imageDetail.json (workspace / BuildOut / S3)"'
+      # 1) Workspace (if previous action or custom ZIP placed it here)
+      - 'if [ -f imageDetail.json ]; then FOUND=imageDetail.json; fi'
+      # 2) Secondary source from CodePipeline (artifact named BuildOut)
+      - 'if [ -z "${FOUND:-}" ] && [ -n "${CODEBUILD_SRC_DIR_BuildOut:-}" ] && [ -f "${CODEBUILD_SRC_DIR_BuildOut}/imageDetail.json" ]; then cp "${CODEBUILD_SRC_DIR_BuildOut}/imageDetail.json" .; FOUND=imageDetail.json; fi'
+      # 3) Optional S3 fallback
+      - 'if [ -z "${FOUND:-}" ] && [ "${USE_S3}" = "true" ]; then aws s3 cp "s3://${S3_BUCKET}/${BUILD_FOLDER}/imageDetail.json" . && FOUND=imageDetail.json || true; fi'
+      - 'test -n "${FOUND:-}" || { echo "ERROR: imageDetail.json not found (workspace / BuildOut / S3)"; env | sort; ls -la; exit 1; }'
       - 'if ! command -v jq >/dev/null 2>&1; then (command -v dnf && sudo dnf install -y jq) || (command -v yum && sudo yum install -y jq) || (command -v apt-get && sudo apt-get update && sudo apt-get install -y jq) || { echo "ERROR: jq install failed"; exit 1; }; fi'
       - 'IMAGE_URI=$(jq -r ".ImageURI // .imageURI // .imageUri // empty" imageDetail.json)'
-      - 'test -n "$IMAGE_URI" && [ "$IMAGE_URI" != "null" ] || { echo "ERROR: ImageURI not found in imageDetail.json"; cat imageDetail.json; exit 1; }'
+      - 'test -n "$IMAGE_URI" && [ "$IMAGE_URI" != "null" ] || { echo "ERROR: ImageURI not in imageDetail.json"; cat imageDetail.json; exit 1; }'
       - 'REGISTRY_HOST=$(echo "$IMAGE_URI" | cut -d"/" -f1)'
       - 'echo "==> ECR login to $REGISTRY_HOST"'
       - 'aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"'
