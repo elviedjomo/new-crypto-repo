@@ -1,5 +1,12 @@
+# Flask==2.1.2
+# Werkzeug==2.1.1
+# psycopg2-binary==2.9.3
+# boto3
+# pdfkit
 Flask==2.1.2
 Werkzeug==2.1.1
-psycopg2-binary==2.9.3
+psycopg2-binary==2.9.9
 boto3
 pdfkit
+# optional: since you run with gunicorn, pin it here too so Dockerfile can do one install
+gunicorn==21.2.0

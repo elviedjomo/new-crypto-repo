@@ -60,36 +60,25 @@
 #     Use an official Python runtime as a parent image
 # ---- Base: small, secure, current Debian ----
     # Base (keep what you have; showing a clean example)
-FROM public.ecr.aws/docker/library/python:3.11-slim-bookworm
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PORT=5000
-
-WORKDIR /app
-
-# Install curl for HEALTHCHECK
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
-  && rm -rf /var/lib/apt/lists/*
-
-# deps first
-COPY requirements.txt .
-RUN python -m pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir gunicorn
-
-# app code
-COPY . .
-
-# (optional) run as non-root if you want:
-# RUN addgroup --system app && adduser --system --ingroup app app && chown -R app:app /app
-# USER app
-
-EXPOSE 5000
-
-# ✅ One-line healthcheck
-HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
-  CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" || exit 1
-
-# Start app (assumes app.py exposes `app = Flask(__name__)`)
-CMD ["gunicorn","-w","2","--threads","8","--timeout","30","-b","0.0.0.0:5000","app:app"]
+    FROM public.ecr.aws/docker/library/python:3.11-slim-bookworm
+    ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PORT=5000
+    WORKDIR /app
+    
+    # tools for healthcheck and pdfkit
+    RUN apt-get update && apt-get install -y --no-install-recommends \
+          curl wkhtmltopdf fonts-dejavu-core \
+      && rm -rf /var/lib/apt/lists/*
+    
+    COPY requirements.txt .
+    # now that gunicorn is in requirements, one install is enough
+    RUN python -m pip install --upgrade pip && \
+        pip install --no-cache-dir -r requirements.txt
+    
+    COPY . .
+    
+    EXPOSE 5000
+    HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
+      CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" || exit 1
+    
+    CMD ["gunicorn","-w","2","--threads","8","--timeout","30","-b","0.0.0.0:5000","app:app"]
+    
