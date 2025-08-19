@@ -35,51 +35,61 @@
 #   files:
 #     - imageDetail.json
 #   discard-paths: yes
-version: 0.2
+# version: 0.2
 
 env:
   variables:
     AWS_DEFAULT_REGION: us-east-1
-    AWS_ACCOUNT_ID: "503561459342"         # <— change if pushing cross-account
-    REPOSITORY_NAME: crypto-project
-    CONTAINER_NAME: app                     # <— ECS task container name if you use imagedefinitions.json
+    AWS_ACCOUNT_ID: "503561459342"    # change if pushing cross-account
+    REPOSITORY_NAME: "crypto-project"
+    CONTAINER_NAME: "app"             # ECS task container name if you ever use imagedefinitions.json
     PUSH_LATEST: "true"
+    S3_BUCKET: "crypto-app-artifact-bucket"
+    BUILD_FOLDER: "crypto-app-build"
+  exported-variables:
+    - REPOSITORY_URI
+    - IMAGE_TAG
+    - IMAGE_URI
 
 phases:
+  install:
+    commands:
+      - set -Eeuo pipefail
+      - echo "==> Docker & AWS CLI"
+      - docker --version
+      - aws --version
+
   pre_build:
     commands:
-      - set -euo pipefail
       - echo "Logging in to Amazon ECR..."
-      - REPOSITORY_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${REPOSITORY_NAME}"
+      - export REPOSITORY_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${REPOSITORY_NAME}"
       - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
       # Optional: ensure repo exists (comment out if your role can't create)
       - aws ecr describe-repositories --repository-names "$REPOSITORY_NAME" >/dev/null 2>&1 || aws ecr create-repository --repository-name "$REPOSITORY_NAME" >/dev/null
-      - COMMIT_HASH="$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" | cut -c1-7 || true)"
-      - IMAGE_TAG="${COMMIT_HASH:-latest}"
-      # Ensure jq exists
-      - command -v jq >/dev/null || (echo "Installing jq..." && (yum install -y jq || (apt-get update && apt-get install -y jq)))
+      - export COMMIT_HASH="$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" | cut -c1-7 || true)"
+      - export IMAGE_TAG="${COMMIT_HASH:-latest}"
+      # Ensure jq exists (works on yum/apt images)
+      - command -v jq >/dev/null || (echo "Installing jq..." && (yum install -y -q jq || (apt-get update -y && apt-get install -y -q jq)))
+
   build:
     commands:
       - echo "Building image ${REPOSITORY_URI}:${IMAGE_TAG}"
       - docker build -t "${REPOSITORY_URI}:${IMAGE_TAG}" .
-      - |
-        if [ "${PUSH_LATEST}" = "true" ]; then
-          docker tag "${REPOSITORY_URI}:${IMAGE_TAG}" "${REPOSITORY_URI}:latest"
-        fi
+      - if [ "${PUSH_LATEST}" = "true" ]; then docker tag "${REPOSITORY_URI}:${IMAGE_TAG}" "${REPOSITORY_URI}:latest"; fi
+
   post_build:
     commands:
       - echo "Pushing image(s)..."
       - docker push "${REPOSITORY_URI}:${IMAGE_TAG}"
-      - |
-        if [ "${PUSH_LATEST}" = "true" ]; then
-          docker push "${REPOSITORY_URI}:latest"
-        fi
-      - IMAGE_URI="${REPOSITORY_URI}:${IMAGE_TAG}"
+      - if [ "${PUSH_LATEST}" = "true" ]; then docker push "${REPOSITORY_URI}:latest"; fi
+      - export IMAGE_URI="${REPOSITORY_URI}:${IMAGE_TAG}"
       - echo "Writing imageDetail.json and imagedefinitions.json..."
-      - echo '{}' | jq --arg img "$IMAGE_URI" '.imageUri = $img' > imageDetail.json
+      - printf '{"imageUri":"%s"}\n' "$IMAGE_URI" > imageDetail.json
       - printf '[{"name":"%s","imageUri":"%s"}]\n' "$CONTAINER_NAME" "$IMAGE_URI" > imagedefinitions.json
-      # Optional: upload to S3 (ensure role has s3:PutObject)
-      - aws s3 cp imageDetail.json s3://crypto-app-artifact-bucket/crypto-app-build/imageDetail.json
+      # Optional: upload to S3 (useful if Test/Deploy don't consume Build artifacts)
+      - echo "Uploading imageDetail.json to s3://${S3_BUCKET}/${BUILD_FOLDER}/imageDetail.json ..."
+      - aws s3 cp imageDetail.json "s3://${S3_BUCKET}/${BUILD_FOLDER}/imageDetail.json" || echo "WARN: S3 upload failed (ok if CodePipeline artifacts are wired)"
+
 artifacts:
   files:
     - imageDetail.json
