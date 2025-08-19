@@ -59,47 +59,37 @@
 #     CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:5000", "app:app"]
 #     Use an official Python runtime as a parent image
 # ---- Base: small, secure, current Debian ----
-    FROM public.ecr.aws/docker/library/python:3.11-slim-bookworm
+    # Base (keep what you have; showing a clean example)
+FROM public.ecr.aws/docker/library/python:3.11-slim-bookworm
 
-    # Hygiene + predictable buffering/caching
-    ENV PYTHONDONTWRITEBYTECODE=1 \
-        PYTHONUNBUFFERED=1 \
-        PIP_NO_CACHE_DIR=1 \
-        PORT=5000
-    
-    # Create unprivileged user
-    RUN addgroup --system app && adduser --system --ingroup app app
-    
-    WORKDIR /app
-    
-    # ---- Dependencies first (better layer caching) ----
-    COPY requirements.txt .
-    RUN python -m pip install --upgrade pip && \
-        pip install --no-cache-dir -r requirements.txt && \
-        pip install --no-cache-dir gunicorn
-    
-    # ---- App code last ----
-    COPY . .
-    RUN chown -R app:app /app
-    
-    # ---- Container networking & health ----
-    EXPOSE 5000
-    HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
-      CMD python - <<'PY' || exit 1
-    import os, sys, urllib.request
-    url=f"http://127.0.0.1:{os.environ.get('PORT','5000')}/healthz"
-    try:
-        with urllib.request.urlopen(url, timeout=2) as r:
-            sys.exit(0 if r.status==200 else 1)
-    except Exception:
-        sys.exit(1)
-    PY
-    
-    # ---- Run as non-root with Gunicorn ----
-    USER app
-    
-    # WEB_CONCURRENCY / THREADS tunables can be set via task env
-    ENV WEB_CONCURRENCY=2 GUNICORN_THREADS=8 GUNICORN_TIMEOUT=30
-    # "app:app" assumes app.py exposes Flask instance `app`
-    CMD ["gunicorn", "-w", "2", "--threads", "8", "--timeout", "30", "-b", "0.0.0.0:5000", "app:app"]
-    
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=5000
+
+WORKDIR /app
+
+# Install curl for HEALTHCHECK
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+  && rm -rf /var/lib/apt/lists/*
+
+# deps first
+COPY requirements.txt .
+RUN python -m pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir gunicorn
+
+# app code
+COPY . .
+
+# (optional) run as non-root if you want:
+# RUN addgroup --system app && adduser --system --ingroup app app && chown -R app:app /app
+# USER app
+
+EXPOSE 5000
+
+# ✅ One-line healthcheck
+HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" || exit 1
+
+# Start app (assumes app.py exposes `app = Flask(__name__)`)
+CMD ["gunicorn","-w","2","--threads","8","--timeout","30","-b","0.0.0.0:5000","app:app"]
