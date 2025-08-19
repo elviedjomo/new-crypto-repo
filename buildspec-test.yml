@@ -55,7 +55,7 @@
 #       - docker stop $CONTAINER_ID
 #       - docker rm $CONTAINER_ID
 #       - echo "Test job completed successfully."
-# version: 0.2
+version: 0.2
 
 env:
   variables:
