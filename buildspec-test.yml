@@ -60,129 +60,59 @@ version: 0.2
 env:
   variables:
     AWS_DEFAULT_REGION: "us-east-1"
-    # If your Pipeline's Test action is wired to take the Build output artifact,
-    # imageDetail.json will already be in the working directory.
-    # If you *must* fetch from S3, set these and flip USE_S3=true.
+
+    # Prefer getting imageDetail.json from the Build stage artifact.
+    # Set USE_S3="true" ONLY if you cannot pass artifacts through CodePipeline.
+    USE_S3: "false"
     S3_BUCKET: "crypto-app-artifact-bucket"
     BUILD_FOLDER: "crypto-app-build"
-    USE_S3: "false"                 # prefer CodePipeline artifacts -> set to "true" only if needed
-    EXTERNAL_PORT: "5000"           # host port
-    CONTAINER_PORT: "5000"          # container port
-    HEALTH_PATH: "/healthz"         # change if your app exposes a different probe path
-    WAIT_TIMEOUT_SECONDS: "60"      # max wait for health to pass
-    SLEEP_SECONDS: "2"              # polling interval
+
+    EXTERNAL_PORT: "5000"          # host port exposed by docker run
+    CONTAINER_PORT: "5000"         # container's listen port
+    HEALTH_PATH: "/healthz"        # change if your app uses a different path
+    WAIT_TIMEOUT_SECONDS: "60"
+    SLEEP_SECONDS: "2"
 
 phases:
   pre_build:
     commands:
-      - set -Eeuo pipefail
-      - echo "==> Environment check"
-      - docker --version
-      - echo "Region: $AWS_DEFAULT_REGION"
-
-      # 1) Obtain imageDetail.json (prefer artifact passed from Build stage)
-      - |
-        if [ "${USE_S3}" = "true" ]; then
-          echo "==> Fetching imageDetail.json from s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json"
-          aws s3 cp "s3://$S3_BUCKET/$BUILD_FOLDER/imageDetail.json" .
-        else
-          echo "==> Using imageDetail.json from CodePipeline input artifact (recommended)"
-        fi
-      - test -f imageDetail.json || { echo "ERROR: imageDetail.json not found"; ls -la; exit 1; }
-
-      # 2) jq (robust install for whichever base the CodeBuild image uses)
-      - |
-        if ! command -v jq >/dev/null 2>&1; then
-          echo "==> Installing jq..."
-          (command -v dnf && sudo dnf install -y jq) || \
-          (command -v yum && sudo yum install -y jq) || \
-          (command -v apt-get && sudo apt-get update && sudo apt-get install -y jq) || \
-          { echo "ERROR: could not install jq"; exit 1; }
-        fi
-
-      # 3) Parse Image URI (accept various casings)
-      - |
-        IMAGE_URI=$(jq -r '.ImageURI // .imageURI // .imageUri // empty' imageDetail.json)
-        test -n "$IMAGE_URI" && [ "$IMAGE_URI" != "null" ] || { echo "ERROR: ImageURI not found in imageDetail.json"; cat imageDetail.json; exit 1; }
-        echo "==> Using Image URI: $IMAGE_URI"
-
-      # 4) ECR login (derive registry host from IMAGE_URI)
-      - REGISTRY_HOST="$(echo "$IMAGE_URI" | cut -d'/' -f1)"
-      - echo "==> Logging in to ECR: $REGISTRY_HOST"
-      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"
-
-      # Precompute health URL
-      - HEALTH_URL="http://127.0.0.1:${EXTERNAL_PORT}${HEALTH_PATH}"
-      - echo "==> Health URL: $HEALTH_URL"
+      - 'set -Eeuo pipefail'
+      - 'echo "==> Locate imageDetail.json"'
+      - 'if [ "${USE_S3}" = "true" ]; then aws s3 cp "s3://${S3_BUCKET}/${BUILD_FOLDER}/imageDetail.json" .; else echo "Using CodePipeline artifact (recommended)"; fi'
+      - 'test -f imageDetail.json || { echo "ERROR: imageDetail.json not found in workspace"; ls -la; exit 1; }'
+      - 'if ! command -v jq >/dev/null 2>&1; then (command -v dnf && sudo dnf install -y jq) || (command -v yum && sudo yum install -y jq) || (command -v apt-get && sudo apt-get update && sudo apt-get install -y jq) || { echo "ERROR: jq install failed"; exit 1; }; fi'
+      - 'IMAGE_URI=$(jq -r ".ImageURI // .imageURI // .imageUri // empty" imageDetail.json)'
+      - 'test -n "$IMAGE_URI" && [ "$IMAGE_URI" != "null" ] || { echo "ERROR: ImageURI not found in imageDetail.json"; cat imageDetail.json; exit 1; }'
+      - 'REGISTRY_HOST=$(echo "$IMAGE_URI" | cut -d"/" -f1)'
+      - 'echo "==> ECR login to $REGISTRY_HOST"'
+      - 'aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"'
 
   build:
     commands:
-      - echo "==> Pulling $IMAGE_URI"
-      - docker pull "$IMAGE_URI"
-
-      # Stable, unique container name
-      - COMMIT_SHORT="$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" | cut -c1-7 || true)"
-      - CONTAINER_NAME="ci-app-${CODEBUILD_BUILD_NUMBER:-0}-${COMMIT_SHORT:-na}"
-      - echo "==> Container name: $CONTAINER_NAME"
-
-      # Start container with its default CMD; pass PORT in case your image expects it
-      - echo "==> Starting container and publishing $EXTERNAL_PORT:$CONTAINER_PORT"
-      - docker run --name "$CONTAINER_NAME" -e PORT="$CONTAINER_PORT" -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" -d "$IMAGE_URI"
-
-      # Collect logs continuously in background for debugging if needed
-      - echo "==> Tailing container logs to server.log"
-      - (docker logs -f "$CONTAINER_NAME" > server.log 2>&1) &
-      - LOG_PID=$!
-
-      # Health wait loop: try host loopback first, then container IP as fallback
-      - |
-        echo "==> Waiting for service to become healthy..."
-        deadline=$(( $(date +%s) + ${WAIT_TIMEOUT_SECONDS} ))
-        READY=0
-        while [ $(date +%s) -lt $deadline ]; do
-          if curl -fsS "$HEALTH_URL" >/dev/null; then
-            echo "==> Health check passed via host loopback: $HEALTH_URL"
-            READY=1
-            break
-          fi
-          sleep "${SLEEP_SECONDS}"
-        done
-
-        if [ "$READY" -ne 1 ]; then
-          CIP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER_NAME" 2>/dev/null || true)"
-          if [ -n "$CIP" ]; then
-            ALT_URL="http://$CIP:${CONTAINER_PORT}${HEALTH_PATH}"
-            echo "==> Trying container bridge IP: $ALT_URL"
-            while [ $(date +%s) -lt $deadline ]; do
-              if curl -fsS "$ALT_URL" >/dev/null; then
-                echo "==> Health check passed via container IP: $ALT_URL"
-                READY=1
-                break
-              fi
-              sleep "${SLEEP_SECONDS}"
-            done
-          fi
-        fi
-
-        if [ "$READY" -ne 1 ]; then
-          echo "ERROR: Health checks failed."
-          echo "--- server.log (tail) ---"; tail -n 200 server.log || true
-          echo "--- docker ps ---"; docker ps -a || true
-          echo "--- ports ---"; docker inspect -f '{{json .NetworkSettings.Ports}}' "$CONTAINER_NAME" || true
-          exit 1
-        fi
+      - 'echo "==> Pulling $IMAGE_URI"'
+      - 'docker pull "$IMAGE_URI"'
+      - 'CONTAINER_NAME="ci-test-${CODEBUILD_BUILD_NUMBER:-0}"'
+      - 'echo "==> Starting container $CONTAINER_NAME on ${EXTERNAL_PORT}:${CONTAINER_PORT}"'
+      - 'docker run --name "$CONTAINER_NAME" -e PORT="$CONTAINER_PORT" -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" -d "$IMAGE_URI"'
+      - '(docker logs -f "$CONTAINER_NAME" > server.log 2>&1) &'
+      - 'HEALTH_URL="http://127.0.0.1:${EXTERNAL_PORT}${HEALTH_PATH}"'
+      - 'echo "==> Waiting for health: $HEALTH_URL (timeout ${WAIT_TIMEOUT_SECONDS}s)"'
+      - 'deadline=$(( $(date +%s) + ${WAIT_TIMEOUT_SECONDS} ))'
+      - 'READY=0; while [ $(date +%s) -lt $deadline ]; do if curl -fsS "$HEALTH_URL" >/dev/null; then READY=1; break; fi; sleep "${SLEEP_SECONDS}"; done'
+      - 'if [ "$READY" -ne 1 ]; then echo "Health check failed"; tail -n 200 server.log || true; docker ps -a || true; docker inspect -f "{{json .NetworkSettings.Ports}}" "$CONTAINER_NAME" || true; exit 1; fi'
+      - 'echo "==> Health OK"'
 
   post_build:
     commands:
-      - echo "==> Stopping container"
-      - docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-      - echo "==> Final server.log (tail)"
-      - tail -n 120 server.log || true
-      - echo "==> Tests completed successfully."
+      - 'echo "==> Stopping container"'
+      - 'docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true'
+      - 'docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true'
+      - 'echo "$IMAGE_URI" > tested_image.txt'
+      - 'echo "==> Test job completed"'
 
 artifacts:
   files:
     - imageDetail.json
+    - tested_image.txt
     - server.log
   discard-paths: yes
-
