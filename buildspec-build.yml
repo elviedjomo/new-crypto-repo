@@ -37,6 +37,8 @@
 #   discard-paths: yes
 version: 0.2
 
+version: 0.2
+
 env:
   variables:
     AWS_DEFAULT_REGION: us-east-1
@@ -90,3 +92,4 @@ artifacts:
     - imageDetail.json
     - imagedefinitions.json
   discard-paths: yes
+
