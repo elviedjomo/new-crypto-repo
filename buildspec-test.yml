@@ -55,13 +55,16 @@
 #       - docker stop $CONTAINER_ID
 #       - docker rm $CONTAINER_ID
 #       - echo "Test job completed successfully."
-version: 0.2
+# version: 0.2
+
 env:
   variables:
     AWS_DEFAULT_REGION: "us-east-1"
+    # Prefer pipeline artifacts; flip to "true" only if you can't pass BuildOut into this job.
     USE_S3: "false"
     S3_BUCKET: "crypto-app-artifact-bucket"
     BUILD_FOLDER: "crypto-app-build"
+
     EXTERNAL_PORT: "5000"
     CONTAINER_PORT: "5000"
     HEALTH_PATH: "/healthz"
@@ -73,12 +76,19 @@ phases:
     commands:
       - 'set -Eeuo pipefail'
       - 'echo "==> Locate imageDetail.json (workspace / any secondary source / S3)"'
+      # 0) Basic tools
+      - 'aws --version || true'
+      - 'docker --version || true'
+      - 'command -v jq >/dev/null || (echo "Installing jq..." && (yum install -y -q jq || (apt-get update -y && apt-get install -y -q jq)))'
+      - 'command -v curl >/dev/null || (echo "Installing curl..." && (yum install -y -q curl || (apt-get update -y && apt-get install -y -q curl)))'
+
       # 1) Current workspace
       - 'FOUND=""; if [ -f imageDetail.json ]; then FOUND=imageDetail.json; fi'
+
       # 2) Any CodePipeline secondary source (name-agnostic)
       - |
         if [ -z "${FOUND}" ]; then
-          for v in $(env | awk -F= "/^CODEBUILD_SRC_DIR_/ {print \$1}"); do
+          for v in $(env | awk -F= '/^CODEBUILD_SRC_DIR_/ {print $1}'); do
             d="${!v}"
             if [ -f "$d/imageDetail.json" ]; then
               cp "$d/imageDetail.json" .
@@ -88,29 +98,55 @@ phases:
             fi
           done
         fi
+
       # 3) Optional S3 fallback
       - 'if [ -z "${FOUND}" ] && [ "${USE_S3}" = "true" ]; then aws s3 cp "s3://${S3_BUCKET}/${BUILD_FOLDER}/imageDetail.json" . && FOUND=imageDetail.json || true; fi'
+
+      # 4) Validate
       - 'test -n "${FOUND}" || { echo "ERROR: imageDetail.json not found (workspace / secondary / S3)"; env | sort; ls -la; exit 1; }'
-      - 'if ! command -v jq >/dev/null 2>&1; then (command -v dnf && sudo dnf install -y jq) || (command -v yum && sudo yum install -y jq) || (command -v apt-get && sudo apt-get update && sudo apt-get install -y jq) || { echo "ERROR: jq install failed"; exit 1; }; fi'
+      - 'cat imageDetail.json || true'
       - 'IMAGE_URI=$(jq -r ".ImageURI // .imageURI // .imageUri // empty" imageDetail.json)'
       - 'test -n "$IMAGE_URI" && [ "$IMAGE_URI" != "null" ] || { echo "ERROR: ImageURI not in imageDetail.json"; cat imageDetail.json; exit 1; }'
       - 'REGISTRY_HOST=$(echo "$IMAGE_URI" | cut -d"/" -f1)'
+      - 'echo "==> ECR login to $REGISTRY_HOST"'
       - 'aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"'
+
   build:
     commands:
+      - 'echo "==> Pulling $IMAGE_URI"'
       - 'docker pull "$IMAGE_URI"'
       - 'CONTAINER_NAME="ci-test-${CODEBUILD_BUILD_NUMBER:-0}"'
+      - 'echo "==> Starting container $CONTAINER_NAME on ${EXTERNAL_PORT}:${CONTAINER_PORT}"'
       - 'docker run --name "$CONTAINER_NAME" -e PORT="$CONTAINER_PORT" -p "${EXTERNAL_PORT}:${CONTAINER_PORT}" -d "$IMAGE_URI"'
       - '(docker logs -f "$CONTAINER_NAME" > server.log 2>&1) &'
       - 'HEALTH_URL="http://127.0.0.1:${EXTERNAL_PORT}${HEALTH_PATH}"'
+      - 'echo "==> Waiting for health: $HEALTH_URL (timeout ${WAIT_TIMEOUT_SECONDS}s)"'
       - 'deadline=$(( $(date +%s) + ${WAIT_TIMEOUT_SECONDS} ))'
-      - 'READY=0; while [ $(date +%s) -lt $deadline ]; do if curl -fsS "$HEALTH_URL" >/dev/null; then READY=1; break; fi; sleep "${SLEEP_SECONDS}"; done'
-      - 'if [ "$READY" -ne 1 ]; then echo "Health check failed"; tail -n 200 server.log || true; docker ps -a || true; docker inspect -f "{{json .NetworkSettings.Ports}}" "$CONTAINER_NAME" || true; exit 1; fi'
+      - |
+        READY=0
+        while [ $(date +%s) -lt $deadline ]; do
+          if curl -fsS "$HEALTH_URL" >/dev/null; then
+            READY=1
+            break
+          fi
+          sleep "${SLEEP_SECONDS}"
+        done
+        if [ "$READY" -ne 1 ]; then
+          echo "Health check FAILED for $HEALTH_URL"
+          echo "--- server.log (tail) ---"; tail -n 200 server.log || true
+          echo "--- docker ps ---"; docker ps -a || true
+          echo "--- ports ---"; docker inspect -f '{{json .NetworkSettings.Ports}}' "$CONTAINER_NAME" || true
+          exit 1
+        fi
+      - 'echo "==> Health OK"'
+
   post_build:
     commands:
+      - 'echo "==> Stopping & removing container"'
       - 'docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true'
       - 'docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true'
       - 'echo "$IMAGE_URI" > tested_image.txt'
+      - 'echo "==> Test job completed"'
 
 artifacts:
   files:
